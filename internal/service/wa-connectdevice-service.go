@@ -183,18 +183,56 @@ func NewWaConnectDeviceService(db *gorm.DB, sqliteDBPath string) (*WaConnectDevi
 	}, nil
 }
 
-// ListDevices returns every device a user owns, oldest first.
+// ListDevices returns every device the calling user is allowed to see,
+// oldest first:
+//
+//   - Company owner: every device belonging to their company, across
+//     every branch (mirrors Laravel's CompanyContextResolver — an owner
+//     is always unrestricted).
+//   - Branch-locked member: only devices under their own branch office,
+//     same company.
+//   - No company context at all (standalone user — most accounts that
+//     predate this feature): unchanged, falls back to the original
+//     "just this user's own devices" behavior.
 func (s *WaConnectDeviceService) ListDevices(userID string) ([]models.WaDevice, error) {
 	var devices []models.WaDevice
-	err := s.db.Where("user_id = ?", userID).Order("created_at ASC").Find(&devices).Error
+	query := s.db.Order("created_at ASC")
+
+	ctx := resolveCompanyContext(s.db, userID)
+
+	switch {
+	case !ctx.Resolved:
+		query = query.Where("user_id = ?", userID)
+	case ctx.IsOwner:
+		query = query.Where("company_id = ?", ctx.CompanyID)
+	default:
+		query = query.Where("company_id = ? AND branch_office_id = ?", ctx.CompanyID, ctx.BranchOfficeID)
+	}
+
+	err := query.Find(&devices).Error
 	return devices, err
 }
 
 // AddDevice registers a brand new device for a user (with a fresh random
 // UUID, assigned by WaDevice.BeforeCreate) and immediately starts pairing
 // it, returning the new device's ID together with its first QR code.
+//
+// CompanyID/BranchOfficeID are stamped once, here, from the creating
+// user's CompanyContext at the moment of creation — see the fields'
+// docblock on models.WaDevice for why this isn't re-derived later.
 func (s *WaConnectDeviceService) AddDevice(ctx context.Context, userID string) (deviceID string, qrCode string, status string, err error) {
+	companyCtx := resolveCompanyContext(s.db, userID)
+
 	device := models.WaDevice{UserID: userID, Status: models.WaStatusPendingQR}
+
+	if companyCtx.Resolved {
+		device.CompanyID = &companyCtx.CompanyID
+
+		if companyCtx.BranchOfficeID != "" {
+			device.BranchOfficeID = &companyCtx.BranchOfficeID
+		}
+	}
+
 	if err := s.db.Create(&device).Error; err != nil {
 		return "", "", "", fmt.Errorf("wa: failed to create device: %w", err)
 	}
@@ -403,14 +441,45 @@ func (s *WaConnectDeviceService) Disconnect(ctx context.Context, userID string, 
 	return s.upsertDevice(deviceID, models.WaDevice{Status: models.WaStatusDisconnected})
 }
 
-// assertOwnership makes sure a device actually belongs to the calling
-// user before any status/action call is allowed to touch it.
+// assertOwnership makes sure the calling user is allowed to act on a
+// device before any status/action call is allowed to touch it. "Allowed"
+// now matches ListDevices' visibility rules, not just literal
+// user_id == userID:
+//
+//   - The device's own creator can always act on it (unchanged from
+//     before — covers every standalone-user device, and is also just the
+//     common case for company devices).
+//   - A company owner can act on any device belonging to their company,
+//     regardless of who added it or which branch it's under.
+//   - A branch-locked member can act on any device under their own
+//     branch, regardless of which specific member of that branch added
+//     it — a branch's devices are meant to be managed by whoever's
+//     responsible for that branch, not locked to whichever individual
+//     happened to click "connect" first.
 func (s *WaConnectDeviceService) assertOwnership(userID string, deviceID string) error {
 	var device models.WaDevice
-	if err := s.db.Where("id = ? AND user_id = ?", deviceID, userID).First(&device).Error; err != nil {
+	if err := s.db.Where("id = ?", deviceID).First(&device).Error; err != nil {
 		return ErrDeviceNotFound
 	}
-	return nil
+
+	if device.UserID == userID {
+		return nil
+	}
+
+	ctx := resolveCompanyContext(s.db, userID)
+	if !ctx.Resolved || device.CompanyID == nil || *device.CompanyID != ctx.CompanyID {
+		return ErrDeviceNotFound
+	}
+
+	if ctx.IsOwner {
+		return nil
+	}
+
+	if device.BranchOfficeID != nil && *device.BranchOfficeID == ctx.BranchOfficeID && ctx.BranchOfficeID != "" {
+		return nil
+	}
+
+	return ErrDeviceNotFound
 }
 
 // AssertOwnership is the exported form of assertOwnership, used by

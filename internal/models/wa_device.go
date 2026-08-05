@@ -25,6 +25,26 @@ type WaDevice struct {
 	ID     string `gorm:"primaryKey;type:char(36)" json:"id"`
 	UserID string `gorm:"column:user_id;type:char(36);not null;index" json:"user_id"`
 
+	// Both nullable and set once, at creation time (see
+	// WaConnectDeviceService.AddDevice) from the creating user's
+	// resolved CompanyContext — never re-derived later, so a device
+	// stays associated with the branch it was added under even if the
+	// creator's own membership later changes. NULL for devices added by
+	// a standalone user with no Company/CompanyToUser row at all
+	// (pre-existing accounts, or anyone outside the company/branch
+	// feature) — ListDevices falls back to the original per-user_id
+	// behavior for those, so nothing that predates this changes.
+	//
+	// CompanyID lets an OWNER see every device across every branch of
+	// their company in one query, without joining through
+	// company_to_users for every other member's devices.
+	// BranchOfficeID is what actually scopes a non-owner member to only
+	// their own branch's devices. Both use *string (not plain string)
+	// so "no company" is distinguishable from "" as an empty column
+	// value.
+	CompanyID      *string `gorm:"column:company_id;type:char(36);index" json:"company_id"`
+	BranchOfficeID *string `gorm:"column:branch_office_id;type:char(36);index" json:"branch_office_id"`
+
 	// Explicit column:"jid" for the same reason as WaChat/WaMessage:
 	// GORM's naming strategy doesn't treat "JID" as a recognized unit.
 	JID         string     `gorm:"column:jid;size:64" json:"jid"`
