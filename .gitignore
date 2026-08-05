@@ -1,2 +1,14 @@
 .env
 .env.backup
+
+# Build artifact — rebuilt via `go build`, shouldn't be versioned
+/server
+
+# Live WhatsApp session database — changes constantly at runtime,
+# must never be overwritten by a git pull/checkout
+/storage/*.db
+/storage/*.db-shm
+/storage/*.db-wal
+
+# Uploaded media, not source code
+/storage/media/
