@@ -20,6 +20,7 @@ func RegisterWaConnectDeviceRoutes(rg *gin.RouterGroup, waController *controller
 		wa.GET("/devices", waController.ListDevices)
 		wa.POST("/devices", waController.AddDevice)
 		wa.GET("/devices/:id/status", waController.Status)
+		wa.GET("/devices/:id/history", waController.History)
 		wa.POST("/devices/:id/reconnect", waController.Reconnect)
 		wa.POST("/devices/:id/disconnect", waController.Disconnect)
 	}

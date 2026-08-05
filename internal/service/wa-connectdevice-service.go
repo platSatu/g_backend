@@ -152,6 +152,79 @@ func (s *WaConnectDeviceService) GetClient(deviceID string) (*whatsmeow.Client, 
 	return sess.client, sess.client != nil
 }
 
+// EnsureConnectedClient returns the live whatsmeow client for a device,
+// attempting one reconnect first if a session exists in this process but
+// its socket has silently dropped — i.e. client.IsConnected() is false
+// even though nothing ever fired events.LoggedOut to flip our tracked
+// status to disconnected (which is what the Connect Device page and chat
+// sync both still read as "healthy"). Without this, SendMessage/SendMedia
+// used to fail outright with "device is not connected" on a device that
+// was really just one Connect() call away from working again.
+func (s *WaConnectDeviceService) EnsureConnectedClient(deviceID string) (*whatsmeow.Client, error) {
+	client, ok := s.GetClient(deviceID)
+	if !ok || client == nil {
+		return nil, fmt.Errorf("wa: device is not connected")
+	}
+
+	if client.IsConnected() {
+		return client, nil
+	}
+
+	s.logger.Warnf("device %s: client not connected when a send was attempted, retrying Connect()", deviceID)
+	s.logHistory(deviceID, models.WaDeviceEventReconnecting, "Terdeteksi tidak terhubung saat mengirim pesan, mencoba menyambung ulang")
+
+	if err := client.Connect(); err != nil {
+		s.logger.Errorf("device %s: reconnect attempt failed: %v", deviceID, err)
+		s.logHistory(deviceID, models.WaDeviceEventReconnectFailed, err.Error())
+		return nil, fmt.Errorf("wa: device is not connected")
+	}
+
+	// Connect() returns as soon as the socket dial kicks off; the
+	// handshake (and IsConnected() flipping true) can lag a beat behind,
+	// so give it a short window instead of failing on that technicality.
+	for i := 0; i < 10; i++ {
+		if client.IsConnected() {
+			s.logger.Infof("device %s: reconnect succeeded", deviceID)
+			s.logHistory(deviceID, models.WaDeviceEventReconnected, "")
+			return client, nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
+	s.logger.Errorf("device %s: still not connected after reconnect attempt", deviceID)
+	s.logHistory(deviceID, models.WaDeviceEventReconnectFailed, "Percobaan sambung ulang tidak berhasil dalam 3 detik")
+	return nil, fmt.Errorf("wa: device is not connected")
+}
+
+// logHistory records one entry in a device's connection history log —
+// best-effort (a logging failure must never break the connection/send
+// flow it's attached to). Read back by GetDeviceHistory, which powers the
+// Connect Device page's per-device "Riwayat" view.
+func (s *WaConnectDeviceService) logHistory(deviceID, event, detail string) {
+	s.db.Create(&models.WaDeviceHistory{
+		DeviceID: deviceID,
+		Event:    event,
+		Detail:   detail,
+	})
+}
+
+// GetDeviceHistory returns a device's connection history, newest first —
+// lets a user see why their device disconnected instead of just a bare
+// "Terputus" badge with no explanation.
+func (s *WaConnectDeviceService) GetDeviceHistory(userID string, deviceID string) ([]models.WaDeviceHistory, error) {
+	if err := s.assertOwnership(userID, deviceID); err != nil {
+		return nil, err
+	}
+
+	var history []models.WaDeviceHistory
+	err := s.db.
+		Where("device_id = ?", deviceID).
+		Order("id DESC").
+		Limit(200).
+		Find(&history).Error
+	return history, err
+}
+
 // NewWaConnectDeviceService opens (or creates) the whatsmeow SQLite store
 // at sqliteDBPath and returns a ready-to-use service.
 func NewWaConnectDeviceService(db *gorm.DB, sqliteDBPath string) (*WaConnectDeviceService, error) {
@@ -292,10 +365,13 @@ func (s *WaConnectDeviceService) connectDevice(ctx context.Context, deviceID str
 	if client.Store.ID != nil {
 		if err := client.Connect(); err != nil {
 			s.removeSession(deviceID)
+			s.logHistory(deviceID, models.WaDeviceEventReconnectFailed, err.Error())
 			return "", "", fmt.Errorf("wa: failed to reconnect existing device: %w", err)
 		}
 		return "", models.WaStatusConnected, nil
 	}
+
+	s.logHistory(deviceID, models.WaDeviceEventPendingQR, "Menunggu pemindaian QR code")
 
 	qrChan, err := client.GetQRChannel(sessCtx)
 	if err != nil {
@@ -350,8 +426,21 @@ func (s *WaConnectDeviceService) eventHandler(deviceID string) whatsmeow.EventHa
 	return func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Connected:
+			s.logger.Infof("device %s: connected", deviceID)
+			s.logHistory(deviceID, models.WaDeviceEventConnected, "")
 			s.markConnected(deviceID)
+		case *events.Disconnected:
+			// Not a logout — whatsmeow's own auto-reconnect will usually
+			// bring this back on its own. Logged (not treated as
+			// disconnected in our tracked status) purely so a silent drop
+			// like the one that caused "device is not connected" send
+			// failures shows up in `journalctl -u g_backend` and the
+			// device's history next time.
+			s.logger.Warnf("device %s: socket disconnected (whatsmeow will attempt to reconnect)", deviceID)
+			s.logHistory(deviceID, models.WaDeviceEventDisconnected, "Koneksi terputus, mencoba menyambung ulang otomatis")
 		case *events.LoggedOut:
+			s.logger.Warnf("device %s: logged out (reason: %v)", deviceID, v.Reason)
+			s.logHistory(deviceID, models.WaDeviceEventLoggedOut, v.Reason.String())
 			s.markDisconnected(deviceID)
 		case *events.Message:
 			if s.messageStore != nil {
@@ -446,6 +535,8 @@ func (s *WaConnectDeviceService) Disconnect(ctx context.Context, userID string, 
 	if sess != nil && sess.client != nil {
 		sess.client.Logout(ctx)
 	}
+
+	s.logHistory(deviceID, models.WaDeviceEventManualDisconnect, "Diputuskan manual dari halaman Device")
 
 	return s.upsertDevice(deviceID, models.WaDevice{Status: models.WaStatusDisconnected})
 }

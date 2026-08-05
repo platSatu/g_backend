@@ -125,6 +125,26 @@ func (wc *WaConnectDeviceController) Reconnect(c *gin.Context) {
 	})
 }
 
+// History returns one device's connection history log (connected,
+// disconnected, logged out, reconnect attempts — newest first), so the
+// Connect Device page's "Riwayat" view can show why a device dropped
+// instead of just its current status.
+func (wc *WaConnectDeviceController) History(c *gin.Context) {
+	userID := c.GetString("user_id")
+	deviceID, ok := deviceIDParam(c)
+	if !ok {
+		return
+	}
+
+	history, err := wc.waService.GetDeviceHistory(userID, deviceID)
+	if err != nil {
+		respondConnectError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"history": history})
+}
+
 // Disconnect logs one of the authenticated user's devices out of
 // WhatsApp.
 func (wc *WaConnectDeviceController) Disconnect(c *gin.Context) {

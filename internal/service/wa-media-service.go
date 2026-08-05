@@ -138,9 +138,9 @@ func (s *WaInboxService) SendMedia(ctx context.Context, userID string, deviceID 
 		return nil, err
 	}
 
-	client, ok := s.devices.GetClient(deviceID)
-	if !ok || client == nil || !client.IsConnected() {
-		return nil, fmt.Errorf("wa: device is not connected")
+	client, err := s.devices.EnsureConnectedClient(deviceID)
+	if err != nil {
+		return nil, err
 	}
 
 	jid, err := types.ParseJID(chatJID)
