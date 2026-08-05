@@ -20,6 +20,7 @@ func RegisterWaMediaRoutes(rg *gin.RouterGroup, mediaController *controllers.WaM
 	chats.Use(middleware.RequireAuth(authService))
 	{
 		chats.POST("/:jid/media", mediaController.SendMedia)
+		chats.GET("/:jid/media-list", mediaController.ListMedia)
 	}
 
 	devices := rg.Group("/wa/devices/:id")

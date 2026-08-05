@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -328,7 +329,36 @@ func (s *WaInboxService) ListChats(userID string, deviceID string) ([]models.WaC
 		Where("device_id = ?", deviceID).
 		Order("last_message_at DESC").
 		Find(&chats).Error
-	return chats, err
+	if err != nil {
+		return nil, err
+	}
+
+	// Fire-and-forget: previously a chat's avatar was only ever fetched
+	// once you opened it (see ensureAvatar, called from ListMessages),
+	// which is why the sidebar showed blank/initial-letter avatars for
+	// every chat you hadn't clicked into yet — "foto profile blm tampil
+	// semuanya". The frontend polls this endpoint every 6s, so a small
+	// capped batch per call gradually backfills the rest without a
+	// slow response now or hammering WhatsApp with hundreds of requests
+	// at once.
+	go s.backfillAvatars(deviceID, chats)
+
+	return chats, nil
+}
+
+func (s *WaInboxService) backfillAvatars(deviceID string, chats []models.WaChat) {
+	const maxPerCall = 15
+	fetched := 0
+	for _, chat := range chats {
+		if fetched >= maxPerCall {
+			return
+		}
+		if chat.AvatarURL != "" || s.avatarAlreadyChecked(deviceID, chat.ChatJID) {
+			continue
+		}
+		s.ensureAvatar(deviceID, chat.ChatJID)
+		fetched++
+	}
 }
 
 // ListMessages returns a chat's message history.
@@ -685,11 +715,51 @@ func (s *WaInboxService) resolveChatName(ctx context.Context, deviceID string, c
 		return s.groupName(ctx, deviceID, client, chat)
 	}
 
+	if chat.Server == "newsletter" {
+		return s.newsletterName(ctx, deviceID, client, chat)
+	}
+
 	if senderPushName != "" {
 		return senderPushName
 	}
 
 	return displayNameFallback(ctx, client, chat)
+}
+
+// newsletterName returns a WhatsApp Channel's actual title (e.g. "PST
+// Digital News"), same cached-first pattern as groupName — channel names
+// practically never change once created, so there's no reason to re-fetch
+// on every incoming message. The one wrinkle: chats created before this
+// function existed already have a wrong cached name (the raw "+<jid
+// digits>" displayNameFallback used to produce for newsletters, which is
+// exactly what showed up as "+120363..." in the UI) — looksLikeRawJID
+// detects that specific shape and forces a re-fetch instead of trusting
+// the bad cached value forever.
+func (s *WaInboxService) newsletterName(ctx context.Context, deviceID string, client *whatsmeow.Client, newsletterJID types.JID) string {
+	var existing models.WaChat
+	hasExisting := s.db.Where(models.WaChat{DeviceID: deviceID, ChatJID: newsletterJID.String()}).First(&existing).Error == nil
+	if hasExisting && existing.Name != "" && !looksLikeRawJID(existing.Name, newsletterJID) {
+		return existing.Name
+	}
+
+	if client == nil {
+		return ""
+	}
+
+	info, err := client.GetNewsletterInfo(ctx, newsletterJID)
+	if err != nil || info == nil {
+		return ""
+	}
+
+	return info.ThreadMeta.Name.Text
+}
+
+// looksLikeRawJID reports whether name is exactly the "+<jid user part>"
+// placeholder displayNameFallback produces when a proper name couldn't be
+// resolved — used to tell a genuinely-resolved cached name apart from a
+// stale fallback that should be retried.
+func looksLikeRawJID(name string, jid types.JID) bool {
+	return strings.TrimPrefix(name, "+") == jid.User
 }
 
 // groupName returns a group's subject, preferring whatever we already

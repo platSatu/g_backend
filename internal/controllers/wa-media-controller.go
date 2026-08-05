@@ -86,6 +86,27 @@ func (mc *WaMediaController) SendMedia(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": message})
 }
 
+// ListMedia returns a chat's media messages of one kind (?type=image,
+// video, or document — defaults to image), for the Inbox detail panel's
+// MEDIA & FILES tabs.
+func (mc *WaMediaController) ListMedia(c *gin.Context) {
+	userID := c.GetString("user_id")
+	deviceID, ok := deviceIDParam(c)
+	if !ok {
+		return
+	}
+	chatJID := c.Param("jid")
+	mediaType := c.DefaultQuery("type", "image")
+
+	items, err := mc.inboxService.ListMedia(userID, deviceID, chatJID, mediaType)
+	if err != nil {
+		respondInboxError(c, err)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"items": items})
+}
+
 // DownloadMedia streams a previously sent/received media file's bytes
 // back to the caller. Ownership is re-checked in the service layer via
 // the device the message belongs to, same as every other per-device

@@ -203,6 +203,38 @@ func (s *WaInboxService) SendMedia(ctx context.Context, userID string, deviceID 
 	return record, nil
 }
 
+// ListMedia returns a chat's media messages of one kind — image, video,
+// or document, the three tabs the Inbox detail panel's MEDIA & FILES
+// section offers — newest first, capped at 100. Only messages that
+// actually have a stored file (MediaPath != "") are returned; a media
+// message whose download failed at the time it arrived has no file to
+// show here.
+func (s *WaInboxService) ListMedia(userID string, deviceID string, chatJID string, mediaType string) ([]models.WaMessage, error) {
+	if err := s.devices.AssertOwnership(userID, deviceID); err != nil {
+		return nil, err
+	}
+
+	switch mediaType {
+	case models.WaMessageTypeImage, models.WaMessageTypeVideo, models.WaMessageTypeDocument:
+		// valid, keep as-is
+	default:
+		mediaType = models.WaMessageTypeImage
+	}
+
+	var messages []models.WaMessage
+	err := s.db.
+		Where("device_id = ? AND chat_jid = ? AND message_type = ? AND media_path <> ''", deviceID, chatJID, mediaType).
+		Order("id DESC").
+		Limit(100).
+		Find(&messages).Error
+	if err != nil {
+		return nil, err
+	}
+
+	s.attachMediaURLs(deviceID, messages)
+	return messages, nil
+}
+
 // GetMediaFile resolves a stored media file's absolute disk path for one
 // message, after checking the caller actually owns the device it belongs
 // to — the same ownership boundary every other per-device method in this
