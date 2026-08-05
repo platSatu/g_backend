@@ -379,9 +379,45 @@ func (s *WaInboxService) ListMessages(userID string, deviceID string, chatJID st
 	// Best-effort niceties: neither failure should break loading messages.
 	s.devices.EnsurePresenceSubscription(deviceID, chatJID)
 	s.ensureAvatar(deviceID, chatJID)
+	s.ensurePhone(deviceID, chatJID)
+	s.markIncomingAsRead(deviceID, chatJID, messages)
 
 	s.attachMediaURLs(deviceID, messages)
 	return messages, nil
+}
+
+// markIncomingAsRead tells WhatsApp (and whoever sent them) that the
+// not-from-me messages in this batch have now been seen — the other
+// side's own tick color depends on this; without it, a message you
+// sent to this device would stay stuck on a single/double grey tick on
+// THEIR end forever, the exact same bug this whole feature is fixing on
+// ours. Best-effort: opening a chat must never fail just because this
+// did. Skipped for group chats — a correct read receipt there needs
+// each message's own sender JID, which this bulk "just opened the
+// chat" path doesn't track; 1:1 chats don't have that wrinkle, since
+// the chat's JID and the sender's JID are the same thing.
+func (s *WaInboxService) markIncomingAsRead(deviceID string, chatJID string, messages []models.WaMessage) {
+	jid, err := types.ParseJID(chatJID)
+	if err != nil || jid.Server == types.GroupServer {
+		return
+	}
+
+	var unreadIDs []types.MessageID
+	for _, m := range messages {
+		if !m.FromMe && m.MessageID != "" {
+			unreadIDs = append(unreadIDs, types.MessageID(m.MessageID))
+		}
+	}
+	if len(unreadIDs) == 0 {
+		return
+	}
+
+	client, ok := s.devices.GetClient(deviceID)
+	if !ok || client == nil {
+		return
+	}
+
+	_ = client.MarkRead(context.Background(), unreadIDs, time.Now(), jid, jid)
 }
 
 // Presence returns the current online/typing state for one chat contact.
@@ -426,6 +462,119 @@ func (s *WaInboxService) ensureAvatar(deviceID string, chatJID string) {
 	s.db.Model(&models.WaChat{}).
 		Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).
 		Update("avatar_url", info.URL)
+}
+
+// ensurePhone resolves and caches a chat's real phone number the first
+// time its chat is opened — mirrors ensureAvatar's lazy-fetch-once
+// pattern just above (find once, cache in wa_chats, never re-check).
+// For ordinary chats the phone number is already sitting right in the
+// JID (jid.User) and needs no network call; only "@lid" chats
+// (WhatsApp's privacy-preserving linked IDs) need an actual resolution
+// through WhatsApp's own LID<->phone mapping — same distinction
+// displayNameFallback above already makes for the chat's *name*, this
+// is the same idea for its phone number. Groups and channels have no
+// phone number at all, so this is a no-op for those JID types.
+func (s *WaInboxService) ensurePhone(deviceID string, chatJID string) {
+	jid, err := types.ParseJID(chatJID)
+	if err != nil || jid.Server == types.GroupServer || jid.Server == "newsletter" {
+		return
+	}
+
+	var chat models.WaChat
+	if err := s.db.Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).First(&chat).Error; err != nil || chat.Phone != "" {
+		return // already resolved, or the chat row doesn't exist yet
+	}
+
+	if jid.Server != "lid" {
+		if jid.User == "" {
+			return
+		}
+		s.db.Model(&models.WaChat{}).
+			Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).
+			Update("phone", "+"+jid.User)
+		return
+	}
+
+	client, ok := s.devices.GetClient(deviceID)
+	if !ok || client == nil || client.Store == nil || client.Store.LIDs == nil {
+		return
+	}
+
+	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pn.User == "" {
+		return // couldn't resolve — left blank rather than showing noise
+	}
+
+	s.db.Model(&models.WaChat{}).
+		Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).
+		Update("phone", "+"+pn.User)
+}
+
+// UpdateMessageStatus advances the delivery/read status of our own sent
+// messages as *events.Receipt events arrive from whatsmeow — this is
+// what makes the tick progression in the frontend (see ackIcon() in
+// resources/views/chat/inbox/inbox.blade.php) actually reflect reality
+// instead of every sent message staying frozen on a single grey tick
+// forever. Implements WaConnectDeviceService's MessageStore interface.
+func (s *WaInboxService) UpdateMessageStatus(deviceID string, evt *events.Receipt) {
+	if evt == nil || len(evt.MessageIDs) == 0 {
+		return
+	}
+
+	status := receiptStatus(evt.Type)
+	if status == "" {
+		return // a receipt type we don't map to a tick (e.g. "sender", "retry")
+	}
+
+	for _, id := range evt.MessageIDs {
+		var msg models.WaMessage
+		err := s.db.
+			Where(models.WaMessage{DeviceID: deviceID, ChatJID: evt.Chat.String(), MessageID: string(id), FromMe: true}).
+			First(&msg).Error
+		if err != nil {
+			continue // not one of ours, or the receipt raced the message insert
+		}
+
+		if messageStatusRank(status) <= messageStatusRank(msg.Status) {
+			continue // never move status backwards (e.g. a delayed "delivered" landing after "read" already did)
+		}
+
+		s.db.Model(&models.WaMessage{}).Where("id = ?", msg.ID).Update("status", status)
+	}
+}
+
+// receiptStatus maps whatsmeow's receipt type to one of our own
+// WaMessageStatus* constants. types.ReceiptTypeDelivered is WhatsApp's
+// own zero-value convention for "plain delivery, nothing special to
+// report" — not a missing/unrecognized type.
+func receiptStatus(t types.ReceiptType) string {
+	switch t {
+	case types.ReceiptTypeDelivered:
+		return models.WaMessageStatusDelivered
+	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
+		return models.WaMessageStatusRead
+	case types.ReceiptTypePlayed:
+		return models.WaMessageStatusPlayed
+	default:
+		return ""
+	}
+}
+
+// messageStatusRank orders WaMessage.Status weakest to strongest so
+// UpdateMessageStatus can refuse to move a message's status backwards.
+func messageStatusRank(status string) int {
+	switch status {
+	case models.WaMessageStatusSent:
+		return 1
+	case models.WaMessageStatusDelivered:
+		return 2
+	case models.WaMessageStatusRead:
+		return 3
+	case models.WaMessageStatusPlayed:
+		return 4
+	default:
+		return 0
+	}
 }
 
 func (s *WaInboxService) avatarAlreadyChecked(deviceID, chatJID string) bool {

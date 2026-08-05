@@ -22,6 +22,14 @@ type WaMessage struct {
 	SenderJID string `gorm:"column:sender_jid;size:64" json:"sender_jid"`
 	FromMe    bool   `gorm:"column:from_me;not null;default:false" json:"from_me"`
 
+	// Status tracks WhatsApp's own delivery/read receipts for messages we
+	// sent (FromMe == true) — see WaInboxService.UpdateMessageStatus,
+	// which advances this as *events.Receipt events arrive from
+	// whatsmeow. Meaningless for incoming messages (nobody reports
+	// delivery/read state back to us for those), left at the default.
+	// One of the WaMessageStatus* constants below.
+	Status string `gorm:"column:status;size:16;not null;default:sent" json:"status"`
+
 	// Body doubles as the media caption for MessageType != "text" — same
 	// column, no separate caption field, since a message never has both.
 	Body string `gorm:"column:body;type:text" json:"body"`
@@ -61,4 +69,17 @@ const (
 	WaMessageTypeAudio    = "audio"
 	WaMessageTypeDocument = "document"
 	WaMessageTypeSticker  = "sticker"
+)
+
+// Status values for WaMessage.Status — mirrors WhatsApp's own delivery
+// receipt progression (sent -> delivered -> read/played). Ordered
+// weakest to strongest; see messageStatusRank in wa-inbox-service.go,
+// which uses this order to make sure a late/out-of-order receipt can
+// never move a message's status backwards (e.g. a delayed "delivered"
+// arriving after a "read" already landed must not downgrade it).
+const (
+	WaMessageStatusSent      = "sent"
+	WaMessageStatusDelivered = "delivered"
+	WaMessageStatusRead      = "read"
+	WaMessageStatusPlayed    = "played"
 )

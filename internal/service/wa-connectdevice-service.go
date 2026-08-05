@@ -54,6 +54,11 @@ type MessageStore interface {
 	// resyncs), so existing chats show up instead of only ones with new
 	// activity after connecting.
 	HandleHistorySync(deviceID string, evt *events.HistorySync)
+
+	// UpdateMessageStatus advances a previously-sent message's delivery
+	// status (sent -> delivered -> read/played) as WhatsApp reports back
+	// on it — see WaInboxService.UpdateMessageStatus.
+	UpdateMessageStatus(deviceID string, evt *events.Receipt)
 }
 
 // waSession is the live, in-memory state for one connected device: the
@@ -368,6 +373,10 @@ func (s *WaConnectDeviceService) eventHandler(deviceID string) whatsmeow.EventHa
 				state = PresenceTyping
 			}
 			s.setPresence(deviceID, v.Chat.String(), PresenceInfo{State: state, LastSeen: time.Now()})
+		case *events.Receipt:
+			if s.messageStore != nil {
+				s.messageStore.UpdateMessageStatus(deviceID, v)
+			}
 		}
 	}
 }
@@ -586,22 +595,66 @@ func (s *WaConnectDeviceService) EnsurePresenceSubscription(deviceID string, cha
 	}
 }
 
-// GetPresence returns the last known presence for one chat contact.
-// Defaults to offline if nothing has been observed yet (e.g. right after
-// subscribing, before WhatsApp has pushed an update).
+// GetPresence returns the last known presence for one chat contact,
+// preferring the live in-memory value (freshest) and falling back to
+// whatever was last persisted to MySQL — see setPresence's docblock for
+// why that fallback matters. Only defaults all the way to Offline with
+// no last-seen time if neither source has ever seen anything for this
+// chat at all (e.g. right after subscribing, before WhatsApp has pushed
+// its first update).
 func (s *WaConnectDeviceService) GetPresence(deviceID string, chatJID string) PresenceInfo {
 	s.presenceMu.Lock()
-	defer s.presenceMu.Unlock()
-
 	if byChat, ok := s.presence[deviceID]; ok {
 		if info, ok := byChat[chatJID]; ok {
+			s.presenceMu.Unlock()
 			return info
 		}
 	}
+	s.presenceMu.Unlock()
+
+	var chat models.WaChat
+	if err := s.db.Where("device_id = ? AND chat_jid = ?", deviceID, chatJID).First(&chat).Error; err == nil && chat.PresenceState != "" {
+		info := PresenceInfo{State: chat.PresenceState}
+		if chat.LastSeenAt != nil {
+			info.LastSeen = *chat.LastSeenAt
+		}
+		// Cache the DB-sourced value in memory too, so the next poll (a
+		// few seconds later, same open chat) doesn't have to hit MySQL
+		// again just to read back the same thing — only the FIRST read
+		// after a restart pays this cost.
+		s.setPresenceMemory(deviceID, chatJID, info)
+		return info
+	}
+
 	return PresenceInfo{State: PresenceOffline}
 }
 
+// setPresence records a fresh presence update from a live whatsmeow
+// event, both in memory (for fast reads on every poll) and in MySQL
+// (so it survives a g_backend restart). Before this, presence was
+// in-memory only — which is exactly why "terakhir dilihat" and the
+// online/offline pill used to look permanently stuck: a perfectly good
+// LastSeen value would vanish the instant the process restarted, even
+// though nothing was actually wrong with the presence subscription
+// itself.
 func (s *WaConnectDeviceService) setPresence(deviceID string, chatJID string, info PresenceInfo) {
+	s.setPresenceMemory(deviceID, chatJID, info)
+
+	// Best-effort: only updates a chat row that already exists (a
+	// presence event can in principle arrive before any WaChat row for
+	// that contact has been created) — never worth failing over, this
+	// is a nice-to-have durability layer, not the source of truth for
+	// whether presence tracking itself is working.
+	updates := map[string]interface{}{"presence_state": info.State}
+	if !info.LastSeen.IsZero() {
+		updates["last_seen_at"] = info.LastSeen
+	}
+	s.db.Model(&models.WaChat{}).
+		Where("device_id = ? AND chat_jid = ?", deviceID, chatJID).
+		Updates(updates)
+}
+
+func (s *WaConnectDeviceService) setPresenceMemory(deviceID string, chatJID string, info PresenceInfo) {
 	s.presenceMu.Lock()
 	defer s.presenceMu.Unlock()
 
