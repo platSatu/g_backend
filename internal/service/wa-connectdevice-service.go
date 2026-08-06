@@ -261,6 +261,122 @@ func NewWaConnectDeviceService(db *gorm.DB, sqliteDBPath string) (*WaConnectDevi
 	}, nil
 }
 
+// RestoreSessions reconnects every device that was last known to be
+// "connected" back into this process's in-memory s.sessions map. Call
+// once at startup, right after NewWaConnectDeviceService — as its own
+// goroutine (`go connectDeviceService.RestoreSessions(ctx)`), since this
+// function itself blocks until every device has either reconnected or
+// failed, and a slow/unreachable device shouldn't delay the HTTP server
+// from accepting requests for everyone else.
+//
+// Device sessions only ever live in s.sessions — see GetClient's
+// docblock — and NewWaConnectDeviceService starts that map empty.
+// Nothing else ever repopulates it on its own: ListDevices/Status both
+// fall back to the DB's last-known `status` column when there's no
+// in-memory session (see Status), so the Connect Device page kept
+// showing "Terhubung" after a restart even though sending would
+// immediately fail with "wa: device is not connected" (see
+// EnsureConnectedClient, which only retries an *existing* session's
+// socket — it never creates one from nothing). Before this existed, the
+// only way to actually recover was opening the Connect Device page and
+// clicking Reconnect for that one device by hand, and nothing prompted
+// anyone to do that until a send somewhere had already failed — exactly
+// what happened to the Google Form auto-reply feature after a routine
+// deploy restart, while the Connect Device page itself still claimed
+// everything was fine.
+//
+// whatsmeow already persists this device's paired credentials to its own
+// SQLite store (see loadOrCreateDevice), so this is a plain reconnect —
+// no QR scan needed, same as the "already paired" branch inside
+// connectDevice(). One goroutine per device so a slow/unreachable one
+// can't delay the others or hold up the HTTP server from starting.
+func (s *WaConnectDeviceService) RestoreSessions(ctx context.Context) {
+	var devices []models.WaDevice
+	if err := s.db.
+		Where("jid IS NOT NULL AND jid != '' AND status = ?", models.WaStatusConnected).
+		Find(&devices).Error; err != nil {
+		s.logger.Errorf("RestoreSessions: failed to list devices to restore: %v", err)
+		return
+	}
+
+	if len(devices) == 0 {
+		return
+	}
+
+	s.logger.Infof("RestoreSessions: restoring %d previously-connected device session(s)...", len(devices))
+
+	var wg sync.WaitGroup
+	for _, d := range devices {
+		wg.Add(1)
+		go func(deviceID string) {
+			defer wg.Done()
+			s.restoreOneSession(ctx, deviceID)
+		}(d.ID)
+	}
+	wg.Wait()
+
+	s.logger.Infof("RestoreSessions: done.")
+}
+
+// restoreOneSession is RestoreSessions' per-device worker — best-effort,
+// never returns an error, since one device's stale/revoked credentials
+// must never stop the rest of the fleet from coming back online.
+func (s *WaConnectDeviceService) restoreOneSession(ctx context.Context, deviceID string) {
+	// Already has a live session (shouldn't happen this early at
+	// startup, but cheap to guard against a double-call) — don't clobber
+	// it with a second client for the same device.
+	if sess := s.getSession(deviceID); sess != nil {
+		return
+	}
+
+	device, err := s.loadOrCreateDevice(ctx, deviceID)
+	if err != nil {
+		s.logger.Warnf("RestoreSessions: device %s: no stored credentials, skipping: %v", deviceID, err)
+		return
+	}
+
+	if device.ID == nil {
+		// loadOrCreateDevice fell through to container.NewDevice() — the
+		// JID this row remembered doesn't match any credentials actually
+		// in whatsmeow's store anymore (wiped/corrupted store, or a very
+		// old row). Nothing to restore; needs a real re-pair via QR.
+		s.logger.Warnf("RestoreSessions: device %s: stored JID has no matching credentials, skipping", deviceID)
+		return
+	}
+
+	client := whatsmeow.NewClient(device, s.logger)
+
+	// Own long-lived context, same reasoning as connectDevice(): this
+	// must outlive the startup call that kicks it off. No QR flow runs
+	// on this path (the device is already paired), so unlike
+	// connectDevice() there's no watchQRChannel goroutine to hand it to
+	// — it's kept solely so sess.cancel (used by removeSession) has
+	// something to call.
+	_, cancel := context.WithCancel(context.Background())
+	sess := &waSession{client: client, status: models.WaStatusPendingQR, cancel: cancel}
+
+	s.mu.Lock()
+	s.sessions[deviceID] = sess
+	s.mu.Unlock()
+
+	client.AddEventHandler(s.eventHandler(deviceID))
+
+	if err := client.Connect(); err != nil {
+		s.logger.Warnf("RestoreSessions: device %s: reconnect failed: %v", deviceID, err)
+		s.removeSession(deviceID)
+		s.logHistory(deviceID, models.WaDeviceEventReconnectFailed, "Gagal disambungkan ulang otomatis saat server restart: "+err.Error())
+		s.upsertDevice(deviceID, models.WaDevice{Status: models.WaStatusDisconnected})
+		return
+	}
+
+	// *events.Connected (see eventHandler) flips the session/DB status to
+	// "connected" once the handshake actually completes — deliberately
+	// not set here, so a device that's genuinely gone (logged out from
+	// the phone while this process was down) doesn't get optimistically
+	// marked connected only to flip back a moment later.
+	s.logHistory(deviceID, models.WaDeviceEventReconnecting, "Disambungkan ulang otomatis saat server start")
+}
+
 // ListDevices returns every device the calling user is allowed to see,
 // oldest first:
 //
