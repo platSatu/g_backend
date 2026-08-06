@@ -207,6 +207,50 @@ func (s *WaInboxService) notifyIncomingMessageWebhook(deviceID, userID, chatJID,
 	}()
 }
 
+// notifyMessageStatusWebhook tells Laravel a sent message's delivery/read
+// status just advanced — same fire-and-forget, best-effort shape as
+// notifyIncomingMessageWebhook above (a slow/unreachable Laravel must
+// never delay whatsmeow's own event processing, and there's no retry
+// queue on this side: a missed receipt just leaves that one
+// wa_message_schedule_logs row one status behind, not wrong).
+func (s *WaInboxService) notifyMessageStatusWebhook(deviceID, messageID, status string) {
+	if s.laravelBaseURL == "" {
+		return
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"device_id":  deviceID,
+		"message_id": messageID,
+		"status":     status,
+	})
+	if err != nil {
+		log.Printf("wa-inbox: failed to marshal message-status webhook payload: %v", err)
+		return
+	}
+
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, s.laravelBaseURL+"/api/webhooks/wa/message-status", bytes.NewReader(payload))
+		if err != nil {
+			log.Printf("wa-inbox: failed to build message-status webhook request: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-KEY", s.webhookAPIKey)
+
+		resp, err := s.webhookClient.Do(req)
+		if err != nil {
+			log.Printf("wa-inbox: message-status webhook to Laravel failed: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 300 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			log.Printf("wa-inbox: message-status webhook to Laravel returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		}
+	}()
+}
+
 // HandleHistorySync ingests the batch of past conversations/messages
 // WhatsApp sends shortly after a device is linked (or periodically
 // resyncs). Without this, only messages that arrive *after* connecting
@@ -570,6 +614,17 @@ func (s *WaInboxService) UpdateMessageStatus(deviceID string, evt *events.Receip
 		}
 
 		s.db.Model(&models.WaMessage{}).Where("id = ?", msg.ID).Update("status", status)
+
+		// Tells Laravel's "Pesan Terjadwal" feature about this same
+		// delivered/read progression, so the Delivered/Read columns on
+		// its index page (App\Http\Controllers\Chat\MessageScheduleController)
+		// reflect reality instead of "sent" being mislabeled as
+		// "delivered" — see App\Http\Controllers\Api\
+		// WaMessageStatusWebhookController on the Laravel side. Only
+		// scheduled sends actually have a matching wa_message_schedule_logs
+		// row for this message_id; a manual inbox send just gets a no-op
+		// there, which is fine.
+		s.notifyMessageStatusWebhook(deviceID, string(id), status)
 	}
 }
 
