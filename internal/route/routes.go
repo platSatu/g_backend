@@ -45,6 +45,15 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB, cfg *config.Config) {
 	// is actually persisted instead of silently dropped.
 	go waService.RestoreSessions(context.Background())
 
+	// Proactive health-check: periodically catches any session whose
+	// socket silently dropped without whatsmeow's own auto-reconnect (or
+	// this backend's own events.Disconnected/LoggedOut handlers) bringing
+	// it back — so a device stuck in that gap gets reconnected on its own
+	// instead of sitting "Terhubung" in the DB while sends against it
+	// keep failing until someone notices. See StartConnectionWatchdog's
+	// docblock for the full reasoning.
+	go waService.StartConnectionWatchdog(context.Background())
+
 	// WaMediaController is a separate controller from WaInboxController
 	// but shares the same WaInboxService instance (media methods live in
 	// wa-media-service.go, added onto *WaInboxService) — one place

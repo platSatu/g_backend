@@ -4,6 +4,8 @@ import (
 	"log"
 
 	"github.com/gin-gonic/gin"
+	"go.mau.fi/whatsmeow/proto/waCompanionReg"
+	"go.mau.fi/whatsmeow/store"
 
 	"g_backend/helper"
 	"g_backend/internal/config"
@@ -14,6 +16,22 @@ import (
 func main() {
 	// Load configuration from .env / OS environment.
 	cfg := config.LoadConfig()
+
+	// Brands every linked device with "Konexa API" (instead of whatsmeow's
+	// default "whatsmeow" / a bare OS name) on WhatsApp's own "Linked
+	// Devices" screen on the phone — store.DeviceProps is a package-level
+	// global read by whatsmeow at pairing time (baked into the
+	// registration payload), so this must run before any
+	// whatsmeow.NewClient(...) call, which is why it's the very first
+	// thing main() does. CLOUD_API is the platform-type value semantically
+	// meant for an unattended API/bot session, as opposed to CHROME/EDGE/
+	// etc. which would render with a literal browser icon on the phone.
+	//
+	// Only affects devices linked (or re-linked) AFTER this deploys —
+	// whatsmeow doesn't retroactively rename an already-paired session,
+	// since the name was already sent to WhatsApp once at pairing time.
+	store.SetOSInfo("Konexa API", [3]uint32{1, 0, 0})
+	store.DeviceProps.PlatformType = waCompanionReg.DeviceProps_CLOUD_API.Enum()
 
 	// Connect to the "teleios" database.
 	db := config.ConnectDB(cfg)

@@ -261,6 +261,26 @@ func NewWaConnectDeviceService(db *gorm.DB, sqliteDBPath string) (*WaConnectDevi
 	}, nil
 }
 
+// maxConcurrentRestores caps how many devices dial WhatsApp's servers at
+// the exact same instant during RestoreSessions. Each device still
+// restores on its own goroutine (one slow/unreachable device must never
+// hold up the rest), but with no cap at all a fleet of, say, 200 devices
+// would all reconnect in the very same instant on every process
+// restart — a burst pattern with no real-world equivalent (a real phone
+// doesn't reconnect in perfect lockstep with 199 others) that's exactly
+// the kind of signal WhatsApp's anti-abuse systems are built to notice.
+// Capped concurrency plus restoreStaggerDelay spreads that startup burst
+// out over a few seconds instead of one instant.
+const maxConcurrentRestores = 5
+
+// restoreStaggerDelay is held after each device finishes connecting,
+// before that concurrency slot is handed to the next device in line —
+// combined with maxConcurrentRestores this throttles the *rate* new
+// connections start at (roughly maxConcurrentRestores per this interval)
+// without making the whole restore process wait for one device at a
+// time.
+const restoreStaggerDelay = 800 * time.Millisecond
+
 // RestoreSessions reconnects every device that was last known to be
 // "connected" back into this process's in-memory s.sessions map. Call
 // once at startup, right after NewWaConnectDeviceService — as its own
@@ -289,7 +309,9 @@ func NewWaConnectDeviceService(db *gorm.DB, sqliteDBPath string) (*WaConnectDevi
 // SQLite store (see loadOrCreateDevice), so this is a plain reconnect —
 // no QR scan needed, same as the "already paired" branch inside
 // connectDevice(). One goroutine per device so a slow/unreachable one
-// can't delay the others or hold up the HTTP server from starting.
+// can't delay the others or hold up the HTTP server from starting — see
+// maxConcurrentRestores/restoreStaggerDelay below for how the *rate*
+// those goroutines actually dial WhatsApp is throttled.
 func (s *WaConnectDeviceService) RestoreSessions(ctx context.Context) {
 	var devices []models.WaDevice
 	if err := s.db.
@@ -306,10 +328,16 @@ func (s *WaConnectDeviceService) RestoreSessions(ctx context.Context) {
 	s.logger.Infof("RestoreSessions: restoring %d previously-connected device session(s)...", len(devices))
 
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConcurrentRestores)
 	for _, d := range devices {
 		wg.Add(1)
+		sem <- struct{}{}
 		go func(deviceID string) {
 			defer wg.Done()
+			defer func() {
+				time.Sleep(restoreStaggerDelay)
+				<-sem
+			}()
 			s.restoreOneSession(ctx, deviceID)
 		}(d.ID)
 	}
@@ -375,6 +403,82 @@ func (s *WaConnectDeviceService) restoreOneSession(ctx context.Context, deviceID
 	// the phone while this process was down) doesn't get optimistically
 	// marked connected only to flip back a moment later.
 	s.logHistory(deviceID, models.WaDeviceEventReconnecting, "Disambungkan ulang otomatis saat server start")
+}
+
+// connectionWatchdogInterval is how often StartConnectionWatchdog sweeps
+// every live session for a socket that's silently dropped. whatsmeow's
+// own EnableAutoReconnect (on by default) already retries a socket that
+// drops mid-connection, but it doesn't cover every gap on its own — a
+// reconnect attempt that itself failed and gave up, or a drop that never
+// even surfaced an events.Disconnected. Left alone, a session stuck in
+// that state just sits there silently "Terhubung" in the DB while every
+// send against it keeps failing, and nothing notices until a user's
+// scheduled message quietly never arrives and they come asking why.
+const connectionWatchdogInterval = 2 * time.Minute
+
+// StartConnectionWatchdog runs forever — call it once as its own
+// goroutine (`go waService.StartConnectionWatchdog(ctx)`), same pattern
+// as RestoreSessions. Every connectionWatchdogInterval it checks each
+// session this process currently holds and proactively reconnects any
+// whose socket is down but whose tracked status still says "connected",
+// instead of waiting for the next send attempt to discover that (see
+// EnsureConnectedClient, which stays as the last-resort safety net for
+// whatever gap this sweep hasn't caught yet — sends still self-heal even
+// if the watchdog's timing missed a particular drop).
+func (s *WaConnectDeviceService) StartConnectionWatchdog(ctx context.Context) {
+	ticker := time.NewTicker(connectionWatchdogInterval)
+	defer ticker.Stop()
+
+	s.logger.Infof("StartConnectionWatchdog: watching every %s for dropped sockets", connectionWatchdogInterval)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.sweepSessions()
+		}
+	}
+}
+
+// sweepSessions is one pass of the watchdog: every currently-held session
+// whose socket is down but is still supposed to be connected gets its
+// own reconnect goroutine, so one slow/unreachable device can't hold up
+// the sweep (or the next tick) for the rest of the fleet.
+func (s *WaConnectDeviceService) sweepSessions() {
+	s.mu.Lock()
+	deviceIDs := make([]string, 0, len(s.sessions))
+	for id := range s.sessions {
+		deviceIDs = append(deviceIDs, id)
+	}
+	s.mu.Unlock()
+
+	for _, deviceID := range deviceIDs {
+		sess := s.getSession(deviceID)
+		if sess == nil || sess.client == nil {
+			continue
+		}
+
+		// Not yet paired (mid-QR-flow) or already healthy — nothing for
+		// the watchdog to do.
+		if sess.client.Store.ID == nil || sess.client.IsConnected() {
+			continue
+		}
+
+		// Only step in for a session that's SUPPOSED to be connected —
+		// one that's pending QR, or already flipped to disconnected by a
+		// real events.LoggedOut, is not this sweep's job to touch.
+		status, _, _ := sess.snapshot()
+		if status != models.WaStatusConnected {
+			continue
+		}
+
+		go func(id string) {
+			if _, err := s.EnsureConnectedClient(id); err != nil {
+				s.logger.Errorf("watchdog: device %s: proactive reconnect failed: %v", id, err)
+			}
+		}(deviceID)
+	}
 }
 
 // ListDevices returns every device the calling user is allowed to see,
