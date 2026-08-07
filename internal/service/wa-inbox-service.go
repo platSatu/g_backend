@@ -125,6 +125,7 @@ func (s *WaInboxService) SaveIncomingMessage(deviceID string, evt *events.Messag
 
 	client, _ := s.devices.GetClient(deviceID)
 	name := s.resolveChatName(context.Background(), deviceID, client, evt.Info.Chat, evt.Info.PushName)
+	senderPhone := s.resolveSenderPhone(deviceID, client, chatJID)
 
 	s.upsertChat(userID, deviceID, chatJID, name, body, evt.Info.Timestamp, !evt.Info.IsFromMe)
 
@@ -146,10 +147,49 @@ func (s *WaInboxService) SaveIncomingMessage(deviceID string, evt *events.Messag
 	// through this same handler and trigger another reply.
 	if !evt.Info.IsFromMe {
 		log.Printf("wa-inbox: SaveIncomingMessage: dispatching incoming-message webhook (device=%s chat=%s bodyLen=%d)", deviceID, chatJID, len(body))
-		s.notifyIncomingMessageWebhook(deviceID, userID, chatJID, string(evt.Info.ID), body, evt.Info.Timestamp)
+		s.notifyIncomingMessageWebhook(deviceID, userID, chatJID, senderPhone, string(evt.Info.ID), body, evt.Info.Timestamp)
 	} else {
 		log.Printf("wa-inbox: SaveIncomingMessage: message is from own device (fromMe) — auto-reply webhook intentionally skipped to avoid reply loops (device=%s)", deviceID)
 	}
+}
+
+// resolveSenderPhone returns the sender's real phone number for chatJID
+// (digits only, no "+"), resolving WhatsApp's "@lid" (Linked ID)
+// addressing through the device's own LID<->phone-number store when
+// needed. This is the same lookup ensurePhone uses to lazily cache
+// wa_chats.phone, but done live/synchronously here so a real number is
+// available at the exact moment the incoming-message webhook fires —
+// ensurePhone's cache is only populated the first time a chat is opened
+// in the inbox UI, which may well be *after* this message (e.g. the very
+// first message in a brand new chat, or a device whose inbox nobody has
+// opened yet).
+//
+// Returns "" if it can't be resolved (group/channel JIDs, or a LID
+// WhatsApp hasn't told this device the phone-number counterpart for
+// yet) — Laravel treats a blank/missing sender_phone as "fall back to
+// parsing chat_jid the old way", so this never blocks the webhook from
+// firing, it just loses the phone-based Jadwal confirmation matching for
+// that one message.
+func (s *WaInboxService) resolveSenderPhone(deviceID string, client *whatsmeow.Client, chatJID string) string {
+	jid, err := types.ParseJID(chatJID)
+	if err != nil || jid.Server == types.GroupServer || jid.Server == "newsletter" {
+		return ""
+	}
+
+	if jid.Server != "lid" {
+		return jid.User
+	}
+
+	if client == nil || client.Store == nil || client.Store.LIDs == nil {
+		return ""
+	}
+
+	pn, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+	if err != nil || pn.User == "" {
+		return ""
+	}
+
+	return pn.User
 }
 
 // notifyIncomingMessageWebhook tells Laravel a text message just arrived,
@@ -160,18 +200,19 @@ func (s *WaInboxService) SaveIncomingMessage(deviceID string, evt *events.Messag
 // synchronously inline in SaveIncomingMessage. Best-effort — if it fails,
 // the message is still saved normally above, just no auto-reply fires for
 // it; there's no retry queue on this side.
-func (s *WaInboxService) notifyIncomingMessageWebhook(deviceID, userID, chatJID, messageID, body string, sentAt time.Time) {
+func (s *WaInboxService) notifyIncomingMessageWebhook(deviceID, userID, chatJID, senderPhone, messageID, body string, sentAt time.Time) {
 	if s.laravelBaseURL == "" {
 		return
 	}
 
 	payload, err := json.Marshal(map[string]any{
-		"device_id":  deviceID,
-		"user_id":    userID,
-		"chat_jid":   chatJID,
-		"message_id": messageID,
-		"body":       body,
-		"sent_at":    sentAt.UTC().Format(time.RFC3339),
+		"device_id":    deviceID,
+		"user_id":      userID,
+		"chat_jid":     chatJID,
+		"sender_phone": senderPhone,
+		"message_id":   messageID,
+		"body":         body,
+		"sent_at":      sentAt.UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		log.Printf("wa-inbox: failed to marshal incoming-message webhook payload: %v", err)
