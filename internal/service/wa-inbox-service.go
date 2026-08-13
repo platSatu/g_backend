@@ -22,12 +22,12 @@ import (
 )
 
 // messageHistoryLimit caps how many messages a chat's *initial* load
-// returns (i.e. right when a chat is opened, afterID == 0 in
+// returns (i.e. right when a chat is opened, afterSeq == 0 in
 // ListMessages). Without a cap, chats carrying a large history-synced
 // backlog would return (and the frontend would fully re-render) their
 // entire history on every single poll — a major source of the UI feeling
 // heavy/laggy. Later polls only ask for messages newer than the last one
-// they've already seen (see ListMessages' afterID parameter), which is a
+// they've already seen (see ListMessages' afterSeq parameter), which is a
 // small, cheap delta regardless of how long the chat's history is.
 const messageHistoryLimit = 50
 
@@ -112,6 +112,16 @@ func (s *WaInboxService) SaveIncomingMessage(deviceID string, evt *events.Messag
 	if media := detectMediaMessage(evt.Message); media != nil {
 		log.Printf("wa-inbox: SaveIncomingMessage: message is media, not text — auto-reply webhook not applicable (device=%s)", deviceID)
 		s.saveIncomingMedia(deviceID, userID, evt, media)
+		return
+	}
+
+	// A poll vote arrives as its own message type (PollUpdateMessage),
+	// carrying no text body at all — without this branch it would simply
+	// fall through extractText() below and be silently dropped as "no
+	// extractable text body". See handlePollVote's docblock for the
+	// decrypt-and-match flow.
+	if evt.Message.GetPollUpdateMessage() != nil {
+		s.handlePollVote(deviceID, evt)
 		return
 	}
 
@@ -381,12 +391,13 @@ func (s *WaInboxService) HandleHistorySync(deviceID string, evt *events.HistoryS
 // duplicate rows.
 //
 // Takes msg by pointer (not value) so GORM's Create can write the
-// database-assigned auto-increment ID back onto the caller's own struct.
-// SendMessage relies on this: its response to the frontend carries this
-// ID, which the frontend then uses as the polling cursor (?after_id=) —
-// if the ID never made it back (as it didn't when this took msg by
-// value), the newly sent message would get re-fetched and appended a
-// second time on the very next poll.
+// database-assigned ID (BeforeCreate's UUID) and Seq (the column's own
+// AUTO_INCREMENT) back onto the caller's own struct. SendMessage relies
+// on this: its response to the frontend carries Seq, which the frontend
+// then uses as the polling cursor (?after_seq=) — if it never made it
+// back (as it didn't when this took msg by value), the newly sent
+// message would get re-fetched and appended a second time on the very
+// next poll.
 func (s *WaInboxService) saveMessageOnce(deviceID string, chatJID string, msg *models.WaMessage) {
 	if msg.MessageID != "" {
 		var existing models.WaMessage
@@ -394,7 +405,8 @@ func (s *WaInboxService) saveMessageOnce(deviceID string, chatJID string, msg *m
 			Where(models.WaMessage{DeviceID: deviceID, ChatJID: chatJID, MessageID: msg.MessageID}).
 			First(&existing).Error
 		if err == nil {
-			msg.ID = existing.ID // already have it — still hand back its real ID
+			msg.ID = existing.ID   // already have it — still hand back its real ID
+			msg.Seq = existing.Seq // and its real ordering cursor
 			return
 		}
 	}
@@ -448,25 +460,28 @@ func (s *WaInboxService) backfillAvatars(deviceID string, chats []models.WaChat)
 
 // ListMessages returns a chat's message history.
 //
-//   - On the initial load (afterID == 0) it returns only the most recent
+//   - On the initial load (afterSeq == 0) it returns only the most recent
 //     messageHistoryLimit messages, oldest first, and triggers the
 //     one-time side effects of opening a chat: marking it read,
 //     subscribing to presence, and fetching the contact's avatar.
-//   - On subsequent polls (afterID > 0) it returns only messages with a
-//     higher ID than that — a small delta the frontend can append,
+//   - On subsequent polls (afterSeq > 0) it returns only messages with a
+//     higher Seq than that — a small delta the frontend can append,
 //     instead of re-fetching (and re-rendering) the whole thread every
-//     few seconds.
-func (s *WaInboxService) ListMessages(userID string, deviceID string, chatJID string, afterID uint) ([]models.WaMessage, error) {
+//     few seconds. Seq (not ID) is what this cursor is built on: ID is a
+//     random UUID with no natural order, while Seq is a plain
+//     AUTO_INCREMENT column kept purely for this kind of ordering — see
+//     models.WaMessage.
+func (s *WaInboxService) ListMessages(userID string, deviceID string, chatJID string, afterSeq uint64) ([]models.WaMessage, error) {
 	if err := s.devices.AssertOwnership(userID, deviceID); err != nil {
 		return nil, err
 	}
 
 	var messages []models.WaMessage
 
-	if afterID > 0 {
+	if afterSeq > 0 {
 		err := s.db.
-			Where("device_id = ? AND chat_jid = ? AND id > ?", deviceID, chatJID, afterID).
-			Order("id ASC").
+			Where("device_id = ? AND chat_jid = ? AND seq > ?", deviceID, chatJID, afterSeq).
+			Order("seq ASC").
 			Find(&messages).Error
 		s.attachMediaURLs(deviceID, messages)
 		return messages, err
@@ -474,7 +489,7 @@ func (s *WaInboxService) ListMessages(userID string, deviceID string, chatJID st
 
 	err := s.db.
 		Where("device_id = ? AND chat_jid = ?", deviceID, chatJID).
-		Order("id DESC").
+		Order("seq DESC").
 		Limit(messageHistoryLimit).
 		Find(&messages).Error
 	if err != nil {
@@ -763,6 +778,250 @@ func (s *WaInboxService) SendMessage(ctx context.Context, userID string, deviceI
 	s.saveMessageOnce(deviceID, chatJID, record)
 
 	return record, nil
+}
+
+// SendPoll sends a native WhatsApp poll (a question with 2+ selectable
+// options) through one of the user's connected devices and records it as
+// an outgoing message — the CRM-facing "survey" building block. See
+// models.WaMessageTypePoll's docblock for why a poll, specifically, is
+// the one interactive message type this app builds on: WhatsApp actively
+// blocks/deprioritizes button and list template messages sent from
+// unofficial (non-Business-API) connections like this one, but a poll is
+// an ordinary consumer-app feature with no such restriction.
+//
+// selectableCount is how many options a voter may pick at once; pass 1
+// for an ordinary single-choice poll (the common case — most CSAT/survey
+// polls should be single-choice, since whatsmeow's DecryptPollVote gives
+// back whichever full set the voter last chose regardless of this
+// number, so this only affects what WhatsApp's own client UI lets the
+// voter tap).
+func (s *WaInboxService) SendPoll(ctx context.Context, userID string, deviceID string, chatJID string, question string, options []string, selectableCount int) (*models.WaMessage, error) {
+	if err := s.devices.AssertOwnership(userID, deviceID); err != nil {
+		return nil, err
+	}
+
+	if len(options) < 2 {
+		return nil, fmt.Errorf("wa: a poll needs at least 2 options")
+	}
+	if selectableCount < 1 {
+		selectableCount = 1
+	}
+	if selectableCount > len(options) {
+		selectableCount = len(options)
+	}
+
+	client, err := s.devices.EnsureConnectedClient(deviceID)
+	if err != nil {
+		return nil, err
+	}
+
+	jid, err := types.ParseJID(chatJID)
+	if err != nil {
+		return nil, fmt.Errorf("wa: invalid chat id: %w", err)
+	}
+
+	pollMsg := client.BuildPollCreation(question, options, selectableCount)
+	resp, err := client.SendMessage(ctx, jid, pollMsg)
+	if err != nil {
+		return nil, fmt.Errorf("wa: failed to send poll: %w", err)
+	}
+
+	optionsJSON, err := json.Marshal(options)
+	if err != nil {
+		return nil, fmt.Errorf("wa: failed to encode poll options: %w", err)
+	}
+
+	now := time.Now()
+	name := s.resolveChatName(ctx, deviceID, client, jid, "")
+	// 📊 prefix mirrors the media types' emoji-prefixed chat preview
+	// convention (see saveIncomingMedia), so a poll stands out in the
+	// chat list the same way a photo/document already does instead of
+	// showing the bare question text with no hint it's a poll.
+	s.upsertChat(userID, deviceID, chatJID, name, "📊 "+question, now, false)
+
+	record := &models.WaMessage{
+		UserID:              userID,
+		DeviceID:            deviceID,
+		ChatJID:             chatJID,
+		MessageID:           string(resp.ID),
+		FromMe:              true,
+		Body:                question,
+		MessageType:         models.WaMessageTypePoll,
+		PollOptions:         string(optionsJSON),
+		PollSelectableCount: selectableCount,
+		SentAt:              now,
+	}
+	s.saveMessageOnce(deviceID, chatJID, record)
+
+	return record, nil
+}
+
+// handlePollVote decrypts an incoming poll vote/update and records the
+// voter's current full selection in wa_poll_votes. Best-effort at every
+// step: a vote is a nice-to-have signal, not something whose failure
+// should ever propagate up into whatsmeow's own event loop.
+//
+// Two things make this different from a normal incoming message:
+//  1. The vote only carries a *hash* of each chosen option (never the
+//     original text) — whatsmeow.HashPollOptions recomputes the same
+//     hashes from the poll's own stored option list so they can be
+//     matched back to the human-readable text.
+//  2. Votes fully REPLACE a voter's previous selection rather than
+//     adding to it (that's how WhatsApp's own poll protocol works, not
+//     a choice made here) — see WaPollVote's docblock for how the
+//     upsert below mirrors that.
+func (s *WaInboxService) handlePollVote(deviceID string, evt *events.Message) {
+	pollUpdate := evt.Message.GetPollUpdateMessage()
+	pollMessageID := pollUpdate.GetPollCreationMessageKey().GetID()
+	if pollMessageID == "" {
+		log.Printf("wa-inbox: handlePollVote: vote event missing its poll's original message id (device=%s) — skipped", deviceID)
+		return
+	}
+
+	// The vote can only be resolved against a poll THIS app sent (we need
+	// its original option list to recompute hashes against) — a poll
+	// history-synced from before this feature existed, or one somehow
+	// created outside this app, has nowhere to attach the vote to.
+	var poll models.WaMessage
+	err := s.db.
+		Where(models.WaMessage{DeviceID: deviceID, MessageID: pollMessageID, MessageType: models.WaMessageTypePoll}).
+		First(&poll).Error
+	if err != nil {
+		log.Printf("wa-inbox: handlePollVote: original poll message %s not found for device %s — vote skipped", pollMessageID, deviceID)
+		return
+	}
+
+	client, ok := s.devices.GetClient(deviceID)
+	if !ok || client == nil {
+		return
+	}
+
+	vote, err := client.DecryptPollVote(context.Background(), evt)
+	if err != nil {
+		log.Printf("wa-inbox: handlePollVote: failed to decrypt vote for poll %s (device=%s): %v", pollMessageID, deviceID, err)
+		return
+	}
+
+	var options []string
+	if err := json.Unmarshal([]byte(poll.PollOptions), &options); err != nil {
+		log.Printf("wa-inbox: handlePollVote: failed to parse stored options for poll %s: %v", pollMessageID, err)
+		return
+	}
+
+	hashes := whatsmeow.HashPollOptions(options)
+	selected := make([]string, 0, len(vote.GetSelectedOptions()))
+	for _, chosenHash := range vote.GetSelectedOptions() {
+		for i, optionHash := range hashes {
+			if bytes.Equal(chosenHash, optionHash) {
+				selected = append(selected, options[i])
+				break
+			}
+		}
+	}
+
+	selectedJSON, err := json.Marshal(selected)
+	if err != nil {
+		log.Printf("wa-inbox: handlePollVote: failed to encode selected options for poll %s: %v", pollMessageID, err)
+		return
+	}
+
+	voterJID := evt.Info.Sender.String()
+
+	var voteRow models.WaPollVote
+	s.db.
+		Where(models.WaPollVote{DeviceID: deviceID, PollMessageID: pollMessageID, VoterJID: voterJID}).
+		Assign(models.WaPollVote{
+			ChatJID:         evt.Info.Chat.String(),
+			SelectedOptions: string(selectedJSON),
+			VotedAt:         evt.Info.Timestamp,
+		}).
+		FirstOrCreate(&voteRow)
+
+	log.Printf("wa-inbox: handlePollVote: recorded vote on poll %s by %s: %v", pollMessageID, voterJID, selected)
+
+	s.notifyPollVoteWebhook(deviceID, pollMessageID, evt.Info.Chat.String(), voterJID, selected)
+}
+
+// notifyPollVoteWebhook tells Laravel a poll vote just arrived — same
+// fire-and-forget, best-effort shape as notifyIncomingMessageWebhook/
+// notifyMessageStatusWebhook above (a slow/unreachable Laravel must never
+// delay whatsmeow's own event processing, and there's no retry queue on
+// this side). Generic on purpose: this app has exactly one consumer of
+// poll votes today (Laravel's CSAT survey feature, matching on
+// poll_message_id — see App\Http\Controllers\Api\
+// WaPollVoteWebhookController), but nothing here is CSAT-specific, so any
+// future poll-based feature can reuse this same event without another
+// round trip through whatsmeow being needed.
+func (s *WaInboxService) notifyPollVoteWebhook(deviceID, pollMessageID, chatJID, voterJID string, selectedOptions []string) {
+	if s.laravelBaseURL == "" {
+		return
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"device_id":        deviceID,
+		"poll_message_id":  pollMessageID,
+		"chat_jid":         chatJID,
+		"voter_jid":        voterJID,
+		"selected_options": selectedOptions,
+	})
+	if err != nil {
+		log.Printf("wa-inbox: failed to marshal poll-vote webhook payload: %v", err)
+		return
+	}
+
+	go func() {
+		req, err := http.NewRequest(http.MethodPost, s.laravelBaseURL+"/api/webhooks/wa/poll-vote", bytes.NewReader(payload))
+		if err != nil {
+			log.Printf("wa-inbox: failed to build poll-vote webhook request: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-KEY", s.webhookAPIKey)
+
+		resp, err := s.webhookClient.Do(req)
+		if err != nil {
+			log.Printf("wa-inbox: poll-vote webhook to Laravel failed: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 300 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			log.Printf("wa-inbox: poll-vote webhook to Laravel returned status %d: %s", resp.StatusCode, string(bodyBytes))
+		}
+	}()
+}
+
+// PollResults returns a poll's current tally: the question/options it
+// was sent with, plus every voter's current selection — the raw material
+// for a CRM-side results view (e.g. "8/12 responded, 5x Puas / 3x Tidak
+// Puas"). Counting/grouping is left to the caller (Laravel already has a
+// precedent for doing aggregate reporting in SQL rather than in-process,
+// see App\Services\Chat\ChatReportingService) since this is a small,
+// per-poll result set, not a high-volume aggregate query.
+func (s *WaInboxService) PollResults(userID string, deviceID string, pollMessageID string) (*models.WaMessage, []models.WaPollVote, error) {
+	if err := s.devices.AssertOwnership(userID, deviceID); err != nil {
+		return nil, nil, err
+	}
+
+	var poll models.WaMessage
+	err := s.db.
+		Where(models.WaMessage{DeviceID: deviceID, MessageID: pollMessageID, MessageType: models.WaMessageTypePoll}).
+		First(&poll).Error
+	if err != nil {
+		return nil, nil, fmt.Errorf("wa: poll message not found: %w", err)
+	}
+
+	var votes []models.WaPollVote
+	err = s.db.
+		Where(models.WaPollVote{DeviceID: deviceID, PollMessageID: pollMessageID}).
+		Order("voted_at ASC").
+		Find(&votes).Error
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return &poll, votes, nil
 }
 
 // upsertChat creates or refreshes a chat's summary row. incrementUnread

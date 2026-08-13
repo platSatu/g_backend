@@ -1,13 +1,34 @@
 package models
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+
+	"g_backend/internal/util"
+)
 
 // WaMessage is a single WhatsApp message belonging to one chat on one
 // connected device. Text and media (image/video/audio/document/sticker)
 // share this one table — MessageType tells the two apart, and the
 // media-only columns are simply empty for plain text messages.
 type WaMessage struct {
-	ID       uint   `gorm:"primaryKey" json:"id"`
+	// ID is a random UUID, not an auto-increment integer — see WaDevice.ID
+	// for the same reasoning (this value shows up in the media download
+	// URL, /api/wa/devices/{id}/media/{messageId}, so an unguessable ID
+	// keeps that route from being enumerable). BeforeCreate below assigns
+	// it.
+	ID string `gorm:"primaryKey;type:char(36)" json:"id"`
+
+	// Seq is a plain auto-increment counter kept ONLY for strict
+	// chronological ordering/pagination — a random UUID has no natural
+	// order, but ListMessages' polling cursor (afterSeq) and the
+	// newest-first history queries still need one. Never used as a
+	// public identifier (that's ID's job); exposed in JSON purely so the
+	// frontend can hand the last message's Seq back as its next poll's
+	// cursor.
+	Seq uint64 `gorm:"autoIncrement;not null;uniqueIndex" json:"seq"`
+
 	UserID   string `gorm:"column:user_id;type:char(36);not null;index" json:"user_id"`
 	DeviceID string `gorm:"column:device_id;type:char(36);not null;index:idx_wa_messages_device_chat" json:"device_id"`
 
@@ -55,10 +76,32 @@ type WaMessage struct {
 
 	SentAt    time.Time `gorm:"column:sent_at" json:"sent_at"`
 	CreatedAt time.Time `json:"created_at"`
+
+	// Poll-only fields (MessageType == WaMessageTypePoll). PollOptions is
+	// a JSON array of the option strings the poll was created with, kept
+	// as plain text (not a normalized child table) because it never
+	// changes after send and is only ever read back as a whole — see
+	// WaInboxService.handlePollVote, which unmarshals this to translate
+	// an incoming vote's option hashes back to readable text.
+	// PollSelectableCount mirrors whatsmeow's own field of the same
+	// meaning: how many options a voter may pick at once (1 for a
+	// single-choice poll).
+	PollOptions         string `gorm:"column:poll_options;type:text" json:"poll_options,omitempty"`
+	PollSelectableCount int    `gorm:"column:poll_selectable_count" json:"poll_selectable_count,omitempty"`
 }
 
 func (WaMessage) TableName() string {
 	return "wa_messages"
+}
+
+// BeforeCreate assigns a random UUID before insert if one wasn't already
+// set — same pattern as WaDevice.BeforeCreate. Seq is left untouched:
+// GORM/MySQL populate it from the column's own AUTO_INCREMENT.
+func (m *WaMessage) BeforeCreate(tx *gorm.DB) error {
+	if m.ID == "" {
+		m.ID = util.NewUUID()
+	}
+	return nil
 }
 
 // Message type values for WaMessage.MessageType.
@@ -69,6 +112,17 @@ const (
 	WaMessageTypeAudio    = "audio"
 	WaMessageTypeDocument = "document"
 	WaMessageTypeSticker  = "sticker"
+
+	// WaMessageTypePoll is a native WhatsApp poll (question + selectable
+	// options) — see WaInboxService.SendPoll. Deliberately the only
+	// "interactive" message type this app builds on: WhatsApp actively
+	// blocks or deprioritizes button/list template messages sent from
+	// non-Business-API (unofficial/whatsmeow) connections, but a poll is
+	// an ordinary consumer-app feature with no such restriction, which is
+	// why it's the safe choice for the anti-ban posture the rest of this
+	// app already takes (see App\Services\Chat\BroadcastThrottleService
+	// and BroadcastOptOutService on the Laravel side).
+	WaMessageTypePoll = "poll"
 )
 
 // Status values for WaMessage.Status — mirrors WhatsApp's own delivery

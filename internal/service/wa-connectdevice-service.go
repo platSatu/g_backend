@@ -219,7 +219,7 @@ func (s *WaConnectDeviceService) GetDeviceHistory(userID string, deviceID string
 	var history []models.WaDeviceHistory
 	err := s.db.
 		Where("device_id = ?", deviceID).
-		Order("id DESC").
+		Order("seq DESC").
 		Limit(200).
 		Find(&history).Error
 	return history, err

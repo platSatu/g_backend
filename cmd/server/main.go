@@ -39,7 +39,7 @@ func main() {
 	// Keep this backend's own tables in sync. The `users` table (and other
 	// business tables) belong to the Laravel app and are intentionally
 	// never auto-migrated here.
-	if err := db.AutoMigrate(&models.WaDevice{}, &models.WaChat{}, &models.WaMessage{}, &models.WaDeviceHistory{}); err != nil {
+	if err := db.AutoMigrate(&models.WaDevice{}, &models.WaChat{}, &models.WaMessage{}, &models.WaDeviceHistory{}, &models.WaPollVote{}); err != nil {
 		log.Fatalf("failed to migrate WhatsApp tables: %v", err)
 	}
 

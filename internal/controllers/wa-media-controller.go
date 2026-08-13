@@ -4,7 +4,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"strconv"
 
 	"github.com/gin-gonic/gin"
 
@@ -118,13 +117,13 @@ func (mc *WaMediaController) DownloadMedia(c *gin.Context) {
 		return
 	}
 
-	messageID, err := strconv.ParseUint(c.Param("messageId"), 10, 64)
-	if err != nil {
+	messageID := c.Param("messageId")
+	if messageID == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid message id"})
 		return
 	}
 
-	path, fileName, mimeType, err := mc.inboxService.GetMediaFile(userID, deviceID, uint(messageID))
+	path, fileName, mimeType, err := mc.inboxService.GetMediaFile(userID, deviceID, messageID)
 	if err != nil {
 		if errors.Is(err, service.ErrDeviceNotFound) || errors.Is(err, service.ErrMediaNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "media not found"})

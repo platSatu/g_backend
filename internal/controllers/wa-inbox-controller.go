@@ -48,10 +48,13 @@ func (ic *WaInboxController) ListChats(c *gin.Context) {
 }
 
 // ListMessages returns the message history for one chat on one device.
-// An optional ?after_id=<id> query param switches this from "give me the
-// recent history" (used when a chat is first opened) to "give me
-// whatever's new since message <id>" (used by the frontend's polling,
+// An optional ?after_seq=<seq> query param switches this from "give me
+// the recent history" (used when a chat is first opened) to "give me
+// whatever's new since message <seq>" (used by the frontend's polling,
 // so it can append instead of re-fetching/re-rendering everything).
+// Deliberately keyed on each message's Seq (a plain AUTO_INCREMENT
+// counter), not its ID (a random UUID with no natural order) — see
+// models.WaMessage.
 func (ic *WaInboxController) ListMessages(c *gin.Context) {
 	userID := c.GetString("user_id")
 	deviceID, ok := deviceIDParam(c)
@@ -60,17 +63,17 @@ func (ic *WaInboxController) ListMessages(c *gin.Context) {
 	}
 	chatJID := c.Param("jid")
 
-	var afterID uint
-	if raw := c.Query("after_id"); raw != "" {
+	var afterSeq uint64
+	if raw := c.Query("after_seq"); raw != "" {
 		parsed, err := strconv.ParseUint(raw, 10, 64)
 		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid after_id"})
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid after_seq"})
 			return
 		}
-		afterID = uint(parsed)
+		afterSeq = parsed
 	}
 
-	messages, err := ic.inboxService.ListMessages(userID, deviceID, chatJID, afterID)
+	messages, err := ic.inboxService.ListMessages(userID, deviceID, chatJID, afterSeq)
 	if err != nil {
 		respondInboxError(c, err)
 		return
@@ -110,6 +113,71 @@ func (ic *WaInboxController) SendMessage(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": message})
+}
+
+type sendPollRequest struct {
+	Question        string   `json:"question" binding:"required"`
+	Options         []string `json:"options" binding:"required,min=2"`
+	SelectableCount int      `json:"selectable_count"`
+}
+
+// SendPoll sends a native WhatsApp poll (survey) to one chat through one
+// of the user's connected devices — see WaInboxService.SendPoll's
+// docblock for why a poll, specifically, is the interactive message type
+// this app supports.
+func (ic *WaInboxController) SendPoll(c *gin.Context) {
+	userID := c.GetString("user_id")
+	deviceID, ok := deviceIDParam(c)
+	if !ok {
+		return
+	}
+	chatJID := c.Param("jid")
+
+	var req sendPollRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request payload — a poll needs a question and at least 2 options"})
+		return
+	}
+
+	selectableCount := req.SelectableCount
+	if selectableCount < 1 {
+		selectableCount = 1
+	}
+
+	message, err := ic.inboxService.SendPoll(c.Request.Context(), userID, deviceID, chatJID, req.Question, req.Options, selectableCount)
+	if err != nil {
+		if errors.Is(err, service.ErrDeviceNotFound) {
+			respondInboxError(c, err)
+			return
+		}
+		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": message})
+}
+
+// PollResults returns a poll's question/options plus every voter's
+// current selection — powers a CRM-side results/tally view.
+func (ic *WaInboxController) PollResults(c *gin.Context) {
+	userID := c.GetString("user_id")
+	deviceID, ok := deviceIDParam(c)
+	if !ok {
+		return
+	}
+	pollMessageID := c.Param("message_id")
+
+	poll, votes, err := ic.inboxService.PollResults(userID, deviceID, pollMessageID)
+	if err != nil {
+		if errors.Is(err, service.ErrDeviceNotFound) {
+			respondInboxError(c, err)
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"poll": poll, "votes": votes})
 }
 
 // Presence returns the current online/typing state for one chat contact.

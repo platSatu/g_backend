@@ -19,6 +19,8 @@ func RegisterWaInboxRoutes(rg *gin.RouterGroup, inboxController *controllers.WaI
 		inbox.GET("", inboxController.ListChats)
 		inbox.GET("/:jid/messages", inboxController.ListMessages)
 		inbox.POST("/:jid/messages", inboxController.SendMessage)
+		inbox.POST("/:jid/polls", inboxController.SendPoll)
+		inbox.GET("/:jid/polls/:message_id/results", inboxController.PollResults)
 		inbox.GET("/:jid/presence", inboxController.Presence)
 	}
 }

@@ -1,6 +1,12 @@
 package models
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+
+	"g_backend/internal/util"
+)
 
 // WaChat is a materialized summary of one conversation (1:1 or group) on
 // one connected WhatsApp device. Scoped by DeviceID (not just UserID),
@@ -8,7 +14,12 @@ import "time"
 // set of WhatsApp chats. Kept up to date whenever a message comes in or
 // goes out, so listing chats never has to scan the full message history.
 type WaChat struct {
-	ID       uint   `gorm:"primaryKey" json:"id"`
+	// ID is a random UUID, not an auto-increment integer — same reasoning
+	// as WaDevice.ID (unguessable, consistent across every table in this
+	// app). Nothing orders/paginates on WaChat.ID (chats are always
+	// listed by LastMessageAt), so unlike WaMessage this table needs no
+	// separate Seq column.
+	ID       string `gorm:"primaryKey;type:char(36)" json:"id"`
 	UserID   string `gorm:"column:user_id;type:char(36);not null;index" json:"user_id"`
 	DeviceID string `gorm:"column:device_id;type:char(36);not null;uniqueIndex:idx_wa_chats_device_jid" json:"device_id"`
 
@@ -51,4 +62,13 @@ type WaChat struct {
 
 func (WaChat) TableName() string {
 	return "wa_chats"
+}
+
+// BeforeCreate assigns a random UUID before insert if one wasn't already
+// set — same pattern as WaDevice.BeforeCreate.
+func (c *WaChat) BeforeCreate(tx *gorm.DB) error {
+	if c.ID == "" {
+		c.ID = util.NewUUID()
+	}
+	return nil
 }

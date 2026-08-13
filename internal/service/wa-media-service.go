@@ -224,7 +224,7 @@ func (s *WaInboxService) ListMedia(userID string, deviceID string, chatJID strin
 	var messages []models.WaMessage
 	err := s.db.
 		Where("device_id = ? AND chat_jid = ? AND message_type = ? AND media_path <> ''", deviceID, chatJID, mediaType).
-		Order("id DESC").
+		Order("seq DESC").
 		Limit(100).
 		Find(&messages).Error
 	if err != nil {
@@ -240,7 +240,7 @@ func (s *WaInboxService) ListMedia(userID string, deviceID string, chatJID strin
 // to — the same ownership boundary every other per-device method in this
 // package enforces. Controllers stream the file straight from the
 // returned path; this layer only authorizes and locates it.
-func (s *WaInboxService) GetMediaFile(userID string, deviceID string, messageID uint) (path string, fileName string, mimeType string, err error) {
+func (s *WaInboxService) GetMediaFile(userID string, deviceID string, messageID string) (path string, fileName string, mimeType string, err error) {
 	if err := s.devices.AssertOwnership(userID, deviceID); err != nil {
 		return "", "", "", err
 	}
@@ -271,7 +271,7 @@ func (s *WaInboxService) attachMediaURL(deviceID string, msg *models.WaMessage) 
 	if msg.MediaPath == "" {
 		return
 	}
-	msg.MediaURL = fmt.Sprintf("/api/wa/devices/%s/media/%d", deviceID, msg.ID)
+	msg.MediaURL = fmt.Sprintf("/api/wa/devices/%s/media/%s", deviceID, msg.ID)
 }
 
 // saveMediaFile writes decrypted media bytes to
