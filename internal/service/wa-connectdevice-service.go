@@ -130,6 +130,36 @@ type WaConnectDeviceService struct {
 	// EnsurePresenceSubscription.
 	subscribedMu sync.Mutex
 	subscribed   map[string]map[string]bool // deviceID -> chatJID -> already subscribed
+
+	// sendSlotsMu/sendSlots is a per-device serialization gate: exactly
+	// one outbound send (text, poll, or media — see AcquireSendSlot's
+	// callers in wa-inbox-service.go/wa-media-service.go) may be in
+	// flight for a given device at any instant, no matter how many HTTP
+	// requests for it arrive at once. A manual chat send, a scheduled
+	// broadcast recipient (App\Jobs\SendScheduledWaMessage on the
+	// Laravel side), and an AI Bot/auto-reply all funnel through the
+	// same gate here.
+	//
+	// This is a physical backstop, NOT the anti-ban pacing itself — that
+	// job belongs to Laravel's own App\Services\Chat\
+	// BroadcastThrottleService, which spaces sends for a device out over
+	// time (and, as of the fix that added it to SendAutoReplyMessage/
+	// SendAiBotReply too, now covers every send path that matters).
+	// Even with correct pacing upstream, network jitter, job retries, or
+	// several queue workers processing different jobs for the same
+	// device can still let two sends land at this backend in the same
+	// instant — without this gate they'd both call client.SendMessage
+	// against the same whatsmeow socket at once, which is exactly the
+	// kind of burst WhatsApp's anti-spam detection flags devices for.
+	// Deliberately never cleaned up in removeSession (unlike `subscribed`
+	// above): a stale entry here is just one idle buffered channel per
+	// device that's ever connected, bounded by device count, and a
+	// device reconnecting later reuses the same slot correctly — safer
+	// than deleting it and risking a fresh AcquireSendSlot call handing
+	// out a brand-new, unlinked channel while an old send is still
+	// holding the previous one.
+	sendSlotsMu sync.Mutex
+	sendSlots   map[string]chan struct{} // deviceID -> 1-buffered token channel
 }
 
 // SetMessageStore wires up where incoming messages get persisted. Calling
@@ -258,7 +288,78 @@ func NewWaConnectDeviceService(db *gorm.DB, sqliteDBPath string) (*WaConnectDevi
 		sessions:   make(map[string]*waSession),
 		presence:   make(map[string]map[string]PresenceInfo),
 		subscribed: make(map[string]map[string]bool),
+		sendSlots:  make(map[string]chan struct{}),
 	}, nil
+}
+
+// sendSlotMaxWait bounds how long AcquireSendSlot will ever wait for a
+// device's send slot before giving up, regardless of the caller's own
+// ctx. Chosen to stay safely under Laravel's queue "retry_after" (90s by
+// default — see config/queue.php's 'database' connection on the Laravel
+// side): that's the window after which a queue worker considers a job's
+// current attempt "lost" and lets another worker pick the SAME job up
+// again. Laravel's own HTTP client to this backend (App\Services\Chat\
+// InboxService) sets no request timeout of its own, so without this
+// bound, a device with a deep backlog of queued sends could make
+// AcquireSendSlot block indefinitely — past retry_after — and end up
+// with two workers both convinced they're the one sending a given
+// message: the original caller (still legitimately waiting its turn)
+// and a second one Laravel dispatched believing the first had died. 25s
+// leaves real headroom under the 90s ceiling for everything else a
+// caller does before/after this wait (JWT mint, throttle/quota checks,
+// the network round trip to WhatsApp itself, DB writes) — this is a
+// last-resort ceiling for a device that's genuinely overloaded, not the
+// expected wait under normal traffic.
+const sendSlotMaxWait = 25 * time.Second
+
+// AcquireSendSlot blocks until the caller holds deviceID's single send
+// slot — i.e. until no other outbound send is currently in flight for
+// that device — or until ctx is done or sendSlotMaxWait elapses,
+// whichever comes first. On success it returns a release func the
+// caller MUST call exactly once (typically via defer) as soon as its own
+// send attempt finishes, success or failure, so the next queued sender
+// can proceed. On failure the returned error is ctx's own error (caller
+// gave up / caller's own deadline) or context.DeadlineExceeded (this
+// device's queue didn't clear within sendSlotMaxWait) — either way,
+// callers surface this as "wa: timed out waiting to send" (see
+// wa-inbox-service.go/wa-media-service.go), a distinct, non-retriable-
+// forever failure rather than a hang. See the sendSlots field's
+// docblock for why this gate exists at all.
+func (s *WaConnectDeviceService) AcquireSendSlot(ctx context.Context, deviceID string) (func(), error) {
+	ctx, cancel := context.WithTimeout(ctx, sendSlotMaxWait)
+	defer cancel()
+
+	slot := s.sendSlot(deviceID)
+
+	select {
+	case <-slot:
+		var released bool
+		return func() {
+			if released {
+				return
+			}
+			released = true
+			slot <- struct{}{}
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// sendSlot returns deviceID's token channel, creating it — pre-filled
+// with one token, i.e. starting out "unlocked" — on first use.
+func (s *WaConnectDeviceService) sendSlot(deviceID string) chan struct{} {
+	s.sendSlotsMu.Lock()
+	defer s.sendSlotsMu.Unlock()
+
+	slot, ok := s.sendSlots[deviceID]
+	if !ok {
+		slot = make(chan struct{}, 1)
+		slot <- struct{}{}
+		s.sendSlots[deviceID] = slot
+	}
+
+	return slot
 }
 
 // maxConcurrentRestores caps how many devices dial WhatsApp's servers at

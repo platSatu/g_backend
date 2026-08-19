@@ -750,6 +750,18 @@ func (s *WaInboxService) SendMessage(ctx context.Context, userID string, deviceI
 		return nil, fmt.Errorf("wa: invalid chat id: %w", err)
 	}
 
+	// Anti-ban backstop: only one outbound send may be in flight for this
+	// device at a time — see WaConnectDeviceService's sendSlots docblock.
+	// Acquired right before the network call, released the instant it
+	// returns (success or failure), so this manual/API send can never
+	// physically overlap with a broadcast recipient or an AI Bot/
+	// auto-reply going out on the same device at the same instant.
+	release, err := s.devices.AcquireSendSlot(ctx, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("wa: timed out waiting to send: %w", err)
+	}
+	defer release()
+
 	proto := &waE2E.Message{Conversation: &body}
 	resp, err := client.SendMessage(ctx, jid, proto)
 	if err != nil {
@@ -819,6 +831,14 @@ func (s *WaInboxService) SendPoll(ctx context.Context, userID string, deviceID s
 	if err != nil {
 		return nil, fmt.Errorf("wa: invalid chat id: %w", err)
 	}
+
+	// Anti-ban backstop — see the identical guard in SendMessage above
+	// for the full reasoning.
+	release, err := s.devices.AcquireSendSlot(ctx, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("wa: timed out waiting to send: %w", err)
+	}
+	defer release()
 
 	pollMsg := client.BuildPollCreation(question, options, selectableCount)
 	resp, err := client.SendMessage(ctx, jid, pollMsg)

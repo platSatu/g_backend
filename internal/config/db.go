@@ -43,11 +43,16 @@ func ConnectDB(cfg *Config) *gorm.DB {
 		log.Fatalf("db: failed to access underlying sql.DB: %v", err)
 	}
 
-	sqlDB.SetMaxOpenConns(25)
-	sqlDB.SetMaxIdleConns(10)
-	sqlDB.SetConnMaxLifetime(5 * time.Minute)
+	// Pool size is configurable (DB_MAX_OPEN_CONNS/DB_MAX_IDLE_CONNS/
+	// DB_CONN_MAX_LIFETIME_MINUTES) — see the Config.DBMaxOpenConns
+	// docblock for how to size this for a real multi-tenant deployment
+	// instead of trusting the default.
+	sqlDB.SetMaxOpenConns(cfg.DBMaxOpenConns)
+	sqlDB.SetMaxIdleConns(cfg.DBMaxIdleConns)
+	sqlDB.SetConnMaxLifetime(time.Duration(cfg.DBConnMaxLifetimeMinutes) * time.Minute)
 
-	log.Printf("db: connected to %q at %s:%s", cfg.DBName, cfg.DBHost, cfg.DBPort)
+	log.Printf("db: connected to %q at %s:%s (pool: max_open=%d max_idle=%d conn_max_lifetime=%dm)",
+		cfg.DBName, cfg.DBHost, cfg.DBPort, cfg.DBMaxOpenConns, cfg.DBMaxIdleConns, cfg.DBConnMaxLifetimeMinutes)
 
 	return db
 }

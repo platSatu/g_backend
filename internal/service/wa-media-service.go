@@ -164,6 +164,19 @@ func (s *WaInboxService) SendMedia(ctx context.Context, userID string, deviceID 
 		return nil, err
 	}
 
+	// Anti-ban backstop — see the identical guard in
+	// WaInboxService.SendMessage (wa-inbox-service.go) for the full
+	// reasoning. Deliberately acquired only around the actual message
+	// send, not the client.Upload call above: uploading bytes to
+	// WhatsApp's media CDN doesn't count as an outbound chat message and
+	// can be slow for large files, so it shouldn't hold up other sends
+	// queued for this device.
+	release, err := s.devices.AcquireSendSlot(ctx, deviceID)
+	if err != nil {
+		return nil, fmt.Errorf("wa: timed out waiting to send: %w", err)
+	}
+	defer release()
+
 	resp, err := client.SendMessage(ctx, jid, protoMsg)
 	if err != nil {
 		return nil, fmt.Errorf("wa: failed to send media message: %w", err)
