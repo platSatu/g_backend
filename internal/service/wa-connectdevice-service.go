@@ -33,12 +33,29 @@ const (
 	PresenceTyping  = "typing"
 )
 
-// PresenceInfo is a snapshot of a contact's presence for one chat, kept
-// in memory only — WhatsApp presence is inherently ephemeral/live data,
-// not something worth persisting to MySQL.
+// PresenceInfo is a snapshot of a contact's presence for one chat —
+// cached in memory and, since a later change, also persisted to MySQL
+// (see setPresence's docblock) so it survives a restart.
 type PresenceInfo struct {
 	State    string    `json:"state"`
 	LastSeen time.Time `json:"last_seen"`
+
+	// Known distinguishes "we asked WhatsApp and it told us this
+	// contact is offline" from "we have never actually received ANY
+	// presence event for this contact" — GetPresence's old behavior
+	// defaulted straight to State: PresenceOffline for both, which is
+	// why every single chat could end up permanently showing a
+	// confident "Offline" pill (22 September 2026 report) even for
+	// contacts that were, in fact, online at that exact moment: nothing
+	// was actually wrong, WhatsApp just never pushed an event because
+	// (a) the contact's own privacy setting doesn't share last-seen/
+	// online status with us at all — a real WhatsApp-side restriction
+	// most contacts have enabled, not a bug this app can fix — or (b)
+	// the subscribe request itself failed silently (see
+	// EnsurePresenceSubscription's now-logged error path). Known: false
+	// tells the frontend to show an honest "tidak diketahui" instead of
+	// a wrong "Offline".
+	Known bool `json:"known"`
 }
 
 // MessageStore persists messages received over an active WhatsApp
@@ -812,13 +829,13 @@ func (s *WaConnectDeviceService) eventHandler(deviceID string) whatsmeow.EventHa
 			if v.Unavailable {
 				state = PresenceOffline
 			}
-			s.setPresence(deviceID, v.From.String(), PresenceInfo{State: state, LastSeen: v.LastSeen})
+			s.setPresence(deviceID, v.From.String(), PresenceInfo{State: state, LastSeen: v.LastSeen, Known: true})
 		case *events.ChatPresence:
 			state := PresenceOnline
 			if v.State == types.ChatPresenceComposing {
 				state = PresenceTyping
 			}
-			s.setPresence(deviceID, v.Chat.String(), PresenceInfo{State: state, LastSeen: time.Now()})
+			s.setPresence(deviceID, v.Chat.String(), PresenceInfo{State: state, LastSeen: time.Now(), Known: true})
 		case *events.Receipt:
 			if s.messageStore != nil {
 				s.messageStore.UpdateMessageStatus(deviceID, v)
@@ -1078,6 +1095,13 @@ func (s *WaConnectDeviceService) EnsurePresenceSubscription(deviceID string, cha
 	s.subscribedMu.Unlock()
 
 	if err := s.SubscribePresence(deviceID, chatJID); err != nil {
+		// Was previously swallowed with no trace at all -- if this is
+		// what's behind "every single chat shows Offline" (22 September
+		// 2026 report), there was literally no way to tell from the
+		// logs whether the subscribe call was even being attempted, let
+		// alone failing. Logged at Warn (not Error) since a transient
+		// failure here is expected and self-heals on the next poll.
+		s.logger.Warnf("wa: presence subscribe failed (device=%s chat=%s): %v", deviceID, chatJID, err)
 		s.subscribedMu.Lock()
 		delete(s.subscribed[deviceID], chatJID)
 		s.subscribedMu.Unlock()
@@ -1103,7 +1127,7 @@ func (s *WaConnectDeviceService) GetPresence(deviceID string, chatJID string) Pr
 
 	var chat models.WaChat
 	if err := s.db.Where("device_id = ? AND chat_jid = ?", deviceID, chatJID).First(&chat).Error; err == nil && chat.PresenceState != "" {
-		info := PresenceInfo{State: chat.PresenceState}
+		info := PresenceInfo{State: chat.PresenceState, Known: true}
 		if chat.LastSeenAt != nil {
 			info.LastSeen = *chat.LastSeenAt
 		}
@@ -1115,6 +1139,11 @@ func (s *WaConnectDeviceService) GetPresence(deviceID string, chatJID string) Pr
 		return info
 	}
 
+	// Known: false (the zero value) here is deliberate -- see
+	// PresenceInfo.Known's docblock. Neither memory nor MySQL has EVER
+	// seen a presence event for this chat, most commonly because the
+	// contact's own WhatsApp privacy setting simply doesn't share this
+	// with us at all, not because they're actually offline right now.
 	return PresenceInfo{State: PresenceOffline}
 }
 

@@ -41,6 +41,19 @@ type WaChat struct {
 	Phone         string    `gorm:"column:phone;size:32" json:"phone,omitempty"`
 
 	AvatarURL     string    `gorm:"column:avatar_url;size:512" json:"avatar_url"`
+
+	// AvatarCheckedAt -- when ensureAvatar() last actually asked WhatsApp
+	// for this contact's profile picture (whether or not one came back).
+	// WhatsApp's profile-picture URLs are NOT permanent despite the old
+	// assumption this cache was built on -- they expire, so a URL fetched
+	// once and cached forever eventually 403s in the browser and the
+	// avatar just silently stops rendering (exactly the "used to show,
+	// now nothing shows, for every contact at once" symptom reported 22
+	// September 2026, since most were originally cached around the same
+	// early period and expired together). ensureAvatar() now re-fetches
+	// once this gets stale instead of trusting avatar_url forever. Not
+	// exposed in JSON (json:"-") -- purely an internal freshness marker.
+	AvatarCheckedAt *time.Time `gorm:"column:avatar_checked_at" json:"-"`
 	LastMessage   string    `gorm:"column:last_message;size:255" json:"last_message"`
 	LastMessageAt time.Time `gorm:"column:last_message_at" json:"last_message_at"`
 

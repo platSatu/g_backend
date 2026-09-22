@@ -48,15 +48,16 @@ type WaInboxService struct {
 	// (sent and received) are written under — see wa-media-service.go.
 	mediaStorageRoot string
 
-	// avatarCheckedMu/avatarChecked remembers which (deviceID, chatJID)
-	// pairs we've already resolved an avatar for (found one, or
-	// confirmed the contact has none) so ListMessages doesn't have to
-	// hit MySQL on every poll just to find out there's nothing new to
-	// fetch. Profile picture URLs are long-lived, so this cache is kept
-	// for the life of the process — no need to invalidate it on
-	// reconnect.
+	// avatarCheckedMu/avatarChecked remembers WHEN we last resolved an
+	// avatar for a (deviceID, chatJID) pair, so ListMessages doesn't hit
+	// MySQL on every single poll just to find out there's nothing new to
+	// fetch. Unlike the old permanent boolean this replaced, a value
+	// here only holds for avatarLocalCacheTTL — WhatsApp's profile
+	// picture URLs are NOT actually permanent (see ensureAvatar's
+	// docblock, and WaChat.AvatarCheckedAt), so this must eventually let
+	// ensureAvatar re-check, not just short-circuit it forever.
 	avatarCheckedMu sync.Mutex
-	avatarChecked   map[string]map[string]bool
+	avatarChecked   map[string]map[string]time.Time
 
 	// laravelBaseURL/webhookAPIKey/webhookClient back notifyIncomingMessageWebhook
 	// below — Laravel's "Auto Reply (Kata Kunci)" feature (matching an
@@ -73,7 +74,7 @@ func NewWaInboxService(db *gorm.DB, devices *WaConnectDeviceService, mediaStorag
 		db:               db,
 		devices:          devices,
 		mediaStorageRoot: mediaStorageRoot,
-		avatarChecked:    make(map[string]map[string]bool),
+		avatarChecked:    make(map[string]map[string]time.Time),
 		laravelBaseURL:   laravelBaseURL,
 		webhookAPIKey:    webhookAPIKey,
 		webhookClient:    &http.Client{Timeout: 5 * time.Second},
@@ -471,7 +472,19 @@ func (s *WaInboxService) backfillAvatars(deviceID string, chats []models.WaChat)
 		if fetched >= maxPerCall {
 			return
 		}
-		if chat.AvatarURL != "" || s.avatarAlreadyChecked(deviceID, chat.ChatJID) {
+		// Used to skip outright whenever chat.AvatarURL was already
+		// non-empty — which is exactly why a sidebar full of avatars
+		// that backfilled in fine once could later go blank for every
+		// contact at the same time (22 September 2026 report):
+		// WhatsApp's profile-picture URLs expire, and this loop never
+		// got a chance to notice or refresh an already-cached one.
+		// ensureAvatar itself now owns the actual staleness check
+		// (WaChat.AvatarCheckedAt vs avatarRefreshInterval); the
+		// avatarCheckedRecently() call here is purely the cheap
+		// in-memory fast-path so this 6s-polled backfill doesn't issue
+		// a MySQL query for a chat it (or ensureAvatar, called for the
+		// same chat via ListMessages) already looked at moments ago.
+		if s.avatarCheckedRecently(deviceID, chat.ChatJID) {
 			continue
 		}
 		s.ensureAvatar(deviceID, chat.ChatJID)
@@ -579,19 +592,34 @@ func (s *WaInboxService) Presence(userID string, deviceID string, chatJID string
 	return s.devices.GetPresence(deviceID, chatJID), nil
 }
 
-// ensureAvatar fetches and caches a contact's profile picture URL the
-// first time their chat is opened. WhatsApp profile picture URLs are
-// long-lived, so we don't bother refreshing them once cached, and we
-// remember (in memory) that we've already checked so repeated polling
-// doesn't keep re-querying MySQL for the same answer.
+// avatarRefreshInterval -- how long a fetched avatar_url (and a
+// confirmed "no picture set" outcome alike) is trusted before
+// ensureAvatar asks WhatsApp again. This used to be "forever" under the
+// old (incorrect) assumption that profile-picture URLs never expire —
+// they do, and once enough of them expired around the same time (most
+// were originally cached in the same early burst of chat opens), EVERY
+// contact's avatar stopped rendering at once, which is exactly the "used
+// to show, now nothing shows, all of them" symptom reported 22 September
+// 2026. 24h balances staying fresh against not hammering WhatsApp's
+// profile-picture endpoint on every chat open.
+const avatarRefreshInterval = 24 * time.Hour
+
+// ensureAvatar fetches and caches a contact's profile picture URL,
+// re-checking once avatarRefreshInterval has passed since the last check
+// (WaChat.AvatarCheckedAt) rather than trusting a cached URL forever —
+// see avatarRefreshInterval's docblock for why that matters. The
+// in-memory avatarChecked map is just a short-lived (avatarRefreshInterval)
+// local cache on top of that DB timestamp, so repeated polling of the
+// same open chat doesn't re-query MySQL every single time either.
 func (s *WaInboxService) ensureAvatar(deviceID string, chatJID string) {
-	if s.avatarAlreadyChecked(deviceID, chatJID) {
+	if s.avatarCheckedRecently(deviceID, chatJID) {
 		return
 	}
 	defer s.markAvatarChecked(deviceID, chatJID)
 
 	var chat models.WaChat
-	if err := s.db.Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).First(&chat).Error; err == nil && chat.AvatarURL != "" {
+	err := s.db.Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).First(&chat).Error
+	if err == nil && chat.AvatarURL != "" && chat.AvatarCheckedAt != nil && time.Since(*chat.AvatarCheckedAt) < avatarRefreshInterval {
 		return
 	}
 
@@ -600,19 +628,31 @@ func (s *WaInboxService) ensureAvatar(deviceID string, chatJID string) {
 		return
 	}
 
-	jid, err := types.ParseJID(chatJID)
-	if err != nil {
+	jid, parseErr := types.ParseJID(chatJID)
+	if parseErr != nil {
 		return
 	}
 
-	info, err := client.GetProfilePictureInfo(context.Background(), jid, nil)
-	if err != nil || info == nil || info.URL == "" {
-		return // no picture set, or WhatsApp declined the request — not fatal
+	now := time.Now()
+	info, fetchErr := client.GetProfilePictureInfo(context.Background(), jid, nil)
+	if fetchErr != nil || info == nil || info.URL == "" {
+		// No picture set, or WhatsApp declined the request — not fatal,
+		// but still record that we checked JUST NOW, so a contact with
+		// genuinely no photo doesn't get re-queried on every single poll
+		// either — only retried again after avatarRefreshInterval, same
+		// as a successful fetch.
+		s.db.Model(&models.WaChat{}).
+			Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).
+			Update("avatar_checked_at", now)
+		return
 	}
 
 	s.db.Model(&models.WaChat{}).
 		Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).
-		Update("avatar_url", info.URL)
+		Updates(map[string]interface{}{
+			"avatar_url":        info.URL,
+			"avatar_checked_at": now,
+		})
 }
 
 // ensurePhone resolves and caches a chat's real phone number the first
@@ -845,19 +885,26 @@ func messageStatusRank(status string) int {
 	}
 }
 
-func (s *WaInboxService) avatarAlreadyChecked(deviceID, chatJID string) bool {
+// avatarCheckedRecently reports whether ensureAvatar has already run for
+// this (deviceID, chatJID) within avatarRefreshInterval — a short-lived
+// local mirror of WaChat.AvatarCheckedAt, purely to spare MySQL a query
+// on every poll of an already-open chat. NOT a permanent "done forever"
+// flag like the old boolean version was — that's exactly what let stale
+// avatar_url values go unrefreshed indefinitely.
+func (s *WaInboxService) avatarCheckedRecently(deviceID, chatJID string) bool {
 	s.avatarCheckedMu.Lock()
 	defer s.avatarCheckedMu.Unlock()
-	return s.avatarChecked[deviceID][chatJID]
+	checkedAt, ok := s.avatarChecked[deviceID][chatJID]
+	return ok && time.Since(checkedAt) < avatarRefreshInterval
 }
 
 func (s *WaInboxService) markAvatarChecked(deviceID, chatJID string) {
 	s.avatarCheckedMu.Lock()
 	defer s.avatarCheckedMu.Unlock()
 	if s.avatarChecked[deviceID] == nil {
-		s.avatarChecked[deviceID] = make(map[string]bool)
+		s.avatarChecked[deviceID] = make(map[string]time.Time)
 	}
-	s.avatarChecked[deviceID][chatJID] = true
+	s.avatarChecked[deviceID][chatJID] = time.Now()
 }
 
 // SendMessage sends a text message through one of the user's connected
