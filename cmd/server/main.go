@@ -1,7 +1,13 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.mau.fi/whatsmeow/proto/waCompanionReg"
@@ -12,6 +18,14 @@ import (
 	"g_backend/internal/models"
 	"g_backend/internal/route"
 )
+
+// shutdownTimeout bounds how long graceful shutdown waits — for
+// in-flight HTTP requests to finish, then for every live WhatsApp socket
+// to close — before main() gives up waiting and exits anyway. Kept
+// under the systemd unit's TimeoutStopSec (see deploy notes) so this
+// code's own timeout is always what ends shutdown, not systemd's harsher
+// SIGKILL landing first and cutting things off mid-sequence.
+const shutdownTimeout = 15 * time.Second
 
 func main() {
 	// Load configuration from .env / OS environment.
@@ -54,12 +68,59 @@ func main() {
 	router := gin.Default()
 	router.Use(helper.CORSMiddleware())
 
-	// Register all routes (auth, wa-connectdevice, ...).
-	route.SetupRoutes(router, db, cfg)
+	// Register all routes (auth, wa-connectdevice, ...). waService is
+	// handed back so the shutdown sequence below can close every live
+	// WhatsApp socket cleanly — see SetupRoutes' docblock.
+	waService := route.SetupRoutes(router, db, cfg)
 
-	// Start listening.
-	log.Printf("server listening on %s", cfg.AppPort)
-	if err := router.Run(cfg.AppPort); err != nil {
-		log.Fatalf("server failed to start: %v", err)
+	// http.Server (not router.Run, which just wraps ListenAndServe and
+	// blocks forever) so this process can actually stop accepting new
+	// requests on demand via Shutdown() below, instead of only ever
+	// being torn down mid-request by the OS.
+	srv := &http.Server{
+		Addr:    cfg.AppPort,
+		Handler: router,
 	}
+
+	// Serve in the background so main() is free to block on the shutdown
+	// signal below instead of on ListenAndServe itself — that's what
+	// makes a controlled shutdown possible at all.
+	go func() {
+		log.Printf("server listening on %s", cfg.AppPort)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server failed to start: %v", err)
+		}
+	}()
+
+	// Block until systemd (or an operator) asks this process to stop.
+	// SIGTERM is what `systemctl stop`/`restart` and a plain `kill` send
+	// by default; SIGINT is Ctrl+C for a manual/local run. Without this,
+	// the process has no way to react to either — the OS just tears it
+	// down mid-request and mid-WhatsApp-socket on every deploy, restart,
+	// or crash-recovery, which is exactly what every restart of this
+	// backend did before this: in-flight HTTP responses cut off, and
+	// every linked device's WhatsApp connection dropped uncleanly
+	// instead of closing tidily and picking back up via RestoreSessions.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+	<-quit
+	log.Println("shutdown signal received, shutting down gracefully...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
+	// Stop accepting new HTTP requests and wait (bounded by ctx above)
+	// for in-flight ones to finish first — an in-progress SendMessage/
+	// SendPoll call gets to complete its response instead of being cut
+	// off mid-request.
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("HTTP server shutdown did not complete cleanly: %v", err)
+	}
+
+	// Only now, with no more HTTP requests being served, close every
+	// live WhatsApp socket cleanly (not a logout — see DisconnectAll's
+	// docblock for why that distinction matters).
+	waService.DisconnectAll()
+
+	log.Println("graceful shutdown complete")
 }

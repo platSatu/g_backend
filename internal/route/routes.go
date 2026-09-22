@@ -16,7 +16,13 @@ import (
 // SetupRoutes wires up dependencies (services -> controllers) and
 // registers every route group under /api. This is the single entry point
 // main.go calls to build the whole HTTP API.
-func SetupRoutes(router *gin.Engine, db *gorm.DB, cfg *config.Config) {
+//
+// Returns the WhatsApp device service so main.go's graceful-shutdown
+// handling can tell it to close every live WhatsApp socket cleanly on
+// the way out (WaConnectDeviceService.DisconnectAll) — everything else
+// SetupRoutes builds is only reachable through the router it configures
+// in place, but shutdown needs this one reference directly.
+func SetupRoutes(router *gin.Engine, db *gorm.DB, cfg *config.Config) *service.WaConnectDeviceService {
 	authService := service.NewAuthService(db, cfg.SecretAPIKey)
 	authController := controllers.NewAuthController(authService)
 
@@ -71,4 +77,6 @@ func SetupRoutes(router *gin.Engine, db *gorm.DB, cfg *config.Config) {
 		RegisterWaInboxRoutes(api, waInboxController, authService)
 		RegisterWaMediaRoutes(api, waMediaController, authService)
 	}
+
+	return waService
 }

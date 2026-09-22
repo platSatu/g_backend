@@ -898,6 +898,47 @@ func (s *WaConnectDeviceService) Disconnect(ctx context.Context, userID string, 
 	return s.upsertDevice(deviceID, models.WaDevice{Status: models.WaStatusDisconnected})
 }
 
+// DisconnectAll closes every live WhatsApp socket cleanly — used only
+// during this process's own graceful shutdown (see cmd/server/main.go's
+// signal handling), never in response to a user action. Deliberately
+// calls the plain whatsmeow Client.Disconnect() here, NOT Logout() —
+// compare with Disconnect (above), which calls Logout on purpose because
+// a user clicking "Disconnect" on the Connect Device page wants to fully
+// unlink that one device. whatsmeow's Client.Disconnect() only tears
+// down the local websocket (no context/error — it's a local operation,
+// not a round trip to WhatsApp's servers); the device's pairing itself
+// is untouched, so RestoreSessions reconnects every one of these devices
+// with the SAME session next time this process starts, no QR re-scan
+// needed. Getting this backwards (calling Logout() here instead) would
+// force every linked device across every company to re-pair from
+// scratch on every deploy/restart — this method exists specifically to
+// prevent that.
+//
+// Same locking pattern as sweepSessions: snapshot the current sessions
+// under the lock, then do the actual per-session work after releasing
+// it, so this never holds mu for longer than copying a slice needs.
+func (s *WaConnectDeviceService) DisconnectAll() {
+	s.mu.Lock()
+	sessions := make([]*waSession, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.mu.Unlock()
+
+	closed := 0
+	for _, sess := range sessions {
+		if sess == nil || sess.client == nil {
+			continue
+		}
+		if sess.client.IsConnected() {
+			sess.client.Disconnect()
+			closed++
+		}
+	}
+
+	s.logger.Infof("DisconnectAll: cleanly closed %d of %d WhatsApp socket(s) for shutdown", closed, len(sessions))
+}
+
 // assertOwnership makes sure the calling user is allowed to act on a
 // device before any status/action call is allowed to touch it. "Allowed"
 // now matches ListDevices' visibility rules, not just literal
