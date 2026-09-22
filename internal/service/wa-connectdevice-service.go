@@ -414,6 +414,12 @@ const restoreStaggerDelay = 800 * time.Millisecond
 // maxConcurrentRestores/restoreStaggerDelay below for how the *rate*
 // those goroutines actually dial WhatsApp is throttled.
 func (s *WaConnectDeviceService) RestoreSessions(ctx context.Context) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Errorf("RestoreSessions: panic recovered: %v", r)
+		}
+	}()
+
 	var devices []models.WaDevice
 	if err := s.db.
 		Where("jid IS NOT NULL AND jid != '' AND status = ?", models.WaStatusConnected).
@@ -434,6 +440,11 @@ func (s *WaConnectDeviceService) RestoreSessions(ctx context.Context) {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(deviceID string) {
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Errorf("RestoreSessions: panic recovered while restoring device %s: %v", deviceID, r)
+				}
+			}()
 			defer wg.Done()
 			defer func() {
 				time.Sleep(restoreStaggerDelay)
@@ -537,7 +548,14 @@ func (s *WaConnectDeviceService) StartConnectionWatchdog(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			s.sweepSessions()
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						s.logger.Errorf("StartConnectionWatchdog: panic recovered during sweep: %v", r)
+					}
+				}()
+				s.sweepSessions()
+			}()
 		}
 	}
 }
@@ -575,6 +593,11 @@ func (s *WaConnectDeviceService) sweepSessions() {
 		}
 
 		go func(id string) {
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Errorf("watchdog: panic recovered while reconnecting device %s: %v", id, r)
+				}
+			}()
 			if _, err := s.EnsureConnectedClient(id); err != nil {
 				s.logger.Errorf("watchdog: device %s: proactive reconnect failed: %v", id, err)
 			}
@@ -723,21 +746,28 @@ func (s *WaConnectDeviceService) connectDevice(ctx context.Context, deviceID str
 // device pairs, the QR expires, or the client disconnects.
 func (s *WaConnectDeviceService) watchQRChannel(deviceID string, sess *waSession, qrChan <-chan whatsmeow.QRChannelItem, firstQR chan<- string) {
 	for evt := range qrChan {
-		switch evt.Event {
-		case "code":
-			sess.setQR(evt.Code)
-			select {
-			case firstQR <- evt.Code:
-			default:
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.logger.Errorf("watchQRChannel: panic recovered for device %s: %v", deviceID, r)
+				}
+			}()
+			switch evt.Event {
+			case "code":
+				sess.setQR(evt.Code)
+				select {
+				case firstQR <- evt.Code:
+				default:
+				}
+			case "timeout":
+				sess.setStatus(models.WaStatusDisconnected)
+				s.upsertDevice(deviceID, models.WaDevice{Status: models.WaStatusDisconnected})
+				s.removeSession(deviceID)
+			case "success":
+				// Connection status is handled by events.Connected below;
+				// nothing extra to do here.
 			}
-		case "timeout":
-			sess.setStatus(models.WaStatusDisconnected)
-			s.upsertDevice(deviceID, models.WaDevice{Status: models.WaStatusDisconnected})
-			s.removeSession(deviceID)
-		case "success":
-			// Connection status is handled by events.Connected below;
-			// nothing extra to do here.
-		}
+		}()
 	}
 }
 
@@ -745,6 +775,12 @@ func (s *WaConnectDeviceService) watchQRChannel(deviceID string, sess *waSession
 // specific device and mirrors the resulting state into MySQL.
 func (s *WaConnectDeviceService) eventHandler(deviceID string) whatsmeow.EventHandler {
 	return func(evt interface{}) {
+		defer func() {
+			if r := recover(); r != nil {
+				s.logger.Errorf("device %s: panic recovered in event handler (event type %T): %v", deviceID, evt, r)
+			}
+		}()
+
 		switch v := evt.(type) {
 		case *events.Connected:
 			s.logger.Infof("device %s: connected", deviceID)

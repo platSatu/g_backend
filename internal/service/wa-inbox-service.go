@@ -232,6 +232,12 @@ func (s *WaInboxService) notifyIncomingMessageWebhook(deviceID, userID, chatJID,
 	log.Printf("wa-inbox: notifyIncomingMessageWebhook: POSTing to %s/api/webhooks/wa/incoming-message (device=%s chat=%s messageID=%s)", s.laravelBaseURL, deviceID, chatJID, messageID)
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("wa-inbox: panic recovered in notifyIncomingMessageWebhook goroutine (device=%s messageID=%s): %v", deviceID, messageID, r)
+			}
+		}()
+
 		req, err := http.NewRequest(http.MethodPost, s.laravelBaseURL+"/api/webhooks/wa/incoming-message", bytes.NewReader(payload))
 		if err != nil {
 			log.Printf("wa-inbox: failed to build incoming-message webhook request: %v", err)
@@ -280,6 +286,12 @@ func (s *WaInboxService) notifyMessageStatusWebhook(deviceID, messageID, status 
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("wa-inbox: panic recovered in notifyMessageStatusWebhook goroutine (device=%s messageID=%s): %v", deviceID, messageID, r)
+			}
+		}()
+
 		req, err := http.NewRequest(http.MethodPost, s.laravelBaseURL+"/api/webhooks/wa/message-status", bytes.NewReader(payload))
 		if err != nil {
 			log.Printf("wa-inbox: failed to build message-status webhook request: %v", err)
@@ -444,6 +456,12 @@ func (s *WaInboxService) ListChats(userID string, deviceID string) ([]models.WaC
 }
 
 func (s *WaInboxService) backfillAvatars(deviceID string, chats []models.WaChat) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("wa-inbox: backfillAvatars: panic recovered for device %s: %v", deviceID, r)
+		}
+	}()
+
 	const maxPerCall = 15
 	fetched := 0
 	for _, chat := range chats {
@@ -990,6 +1008,12 @@ func (s *WaInboxService) notifyPollVoteWebhook(deviceID, pollMessageID, chatJID,
 	}
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("wa-inbox: panic recovered in notifyPollVoteWebhook goroutine (device=%s pollMessageID=%s): %v", deviceID, pollMessageID, r)
+			}
+		}()
+
 		req, err := http.NewRequest(http.MethodPost, s.laravelBaseURL+"/api/webhooks/wa/poll-vote", bytes.NewReader(payload))
 		if err != nil {
 			log.Printf("wa-inbox: failed to build poll-vote webhook request: %v", err)
