@@ -270,15 +270,18 @@ func (s *WaInboxService) notifyIncomingMessageWebhook(deviceID, userID, chatJID,
 // never delay whatsmeow's own event processing, and there's no retry
 // queue on this side: a missed receipt just leaves that one
 // wa_message_schedule_logs row one status behind, not wrong).
-func (s *WaInboxService) notifyMessageStatusWebhook(deviceID, messageID, status string) {
+func (s *WaInboxService) notifyMessageStatusWebhook(deviceID, messageID, status string, deliveredCount, readCount, recipientTotal int) {
 	if s.laravelBaseURL == "" {
 		return
 	}
 
 	payload, err := json.Marshal(map[string]any{
-		"device_id":  deviceID,
-		"message_id": messageID,
-		"status":     status,
+		"device_id":       deviceID,
+		"message_id":      messageID,
+		"status":          status,
+		"delivered_count": deliveredCount,
+		"read_count":      readCount,
+		"recipient_total": recipientTotal,
 	})
 	if err != nil {
 		log.Printf("wa-inbox: failed to marshal message-status webhook payload: %v", err)
@@ -674,6 +677,15 @@ func (s *WaInboxService) UpdateMessageStatus(deviceID string, evt *events.Receip
 		return // a receipt type we don't map to a tick (e.g. "sender", "retry")
 	}
 
+	// evt.Sender is the ONE participant this specific receipt is from —
+	// the group member who just delivered/read it, or the chat partner
+	// themselves for a 1:1 chat (Sender == Chat there). WhatsApp sends a
+	// separate *events.Receipt per group member, never one combined
+	// receipt for the whole group — see WaMessageReceipt's docblock for
+	// why that matters (a single WaMessage.Status column can only ever
+	// record "has ANYONE reached this far", never "how many members").
+	participantJID := evt.Sender.String()
+
 	for _, id := range evt.MessageIDs {
 		var msg models.WaMessage
 		err := s.db.
@@ -683,23 +695,120 @@ func (s *WaInboxService) UpdateMessageStatus(deviceID string, evt *events.Receip
 			continue // not one of ours, or the receipt raced the message insert
 		}
 
-		if messageStatusRank(status) <= messageStatusRank(msg.Status) {
-			continue // never move status backwards (e.g. a delayed "delivered" landing after "read" already did)
+		// Per-participant ratchet — upserts THIS participant's own
+		// progression, independent of every other participant's, so a
+		// second/third/... group member's receipt keeps being counted
+		// even after the message-wide status below has already maxed
+		// out from the first member who read it.
+		var receipt models.WaMessageReceipt
+		receiptErr := s.db.
+			Where(models.WaMessageReceipt{WaMessageID: msg.ID, ParticipantJID: participantJID}).
+			First(&receipt).Error
+
+		if receiptErr != nil {
+			s.db.Create(&models.WaMessageReceipt{
+				WaMessageID:    msg.ID,
+				ParticipantJID: participantJID,
+				Status:         status,
+			})
+		} else if messageStatusRank(status) > messageStatusRank(receipt.Status) {
+			s.db.Model(&models.WaMessageReceipt{}).Where("id = ?", receipt.ID).Update("status", status)
 		}
 
-		s.db.Model(&models.WaMessage{}).Where("id = ?", msg.ID).Update("status", status)
+		// Message-wide ratchet (unchanged from before) — "has ANY
+		// participant reached this far", still what drives the single
+		// ✓✓ tick icon in the inbox UI (ackIcon() in inbox.blade.php).
+		if messageStatusRank(status) > messageStatusRank(msg.Status) {
+			s.db.Model(&models.WaMessage{}).Where("id = ?", msg.ID).Update("status", status)
+		}
+
+		deliveredCount, readCount := s.aggregateReceiptCounts(msg.ID)
+		recipientTotal := s.recipientTotalFor(deviceID, evt.Chat)
 
 		// Tells Laravel's "Pesan Terjadwal" feature about this same
 		// delivered/read progression, so the Delivered/Read columns on
-		// its index page (App\Http\Controllers\Chat\MessageScheduleController)
-		// reflect reality instead of "sent" being mislabeled as
-		// "delivered" — see App\Http\Controllers\Api\
+		// its index/history pages (App\Http\Controllers\Chat\
+		// MessageScheduleController) reflect reality — including, for a
+		// group recipient, an actual "x dari y dibaca" count instead of
+		// a binary yes/no — see App\Http\Controllers\Api\
 		// WaMessageStatusWebhookController on the Laravel side. Only
 		// scheduled sends actually have a matching wa_message_schedule_logs
 		// row for this message_id; a manual inbox send just gets a no-op
-		// there, which is fine.
-		s.notifyMessageStatusWebhook(deviceID, string(id), status)
+		// there, which is fine. Notified on every receipt (not just ones
+		// that advance msg.Status), since a second/third group member's
+		// receipt should still grow the counts even when the message-wide
+		// status itself already maxed out.
+		s.notifyMessageStatusWebhook(deviceID, string(id), status, deliveredCount, readCount, recipientTotal)
 	}
+}
+
+// aggregateReceiptCounts counts how many DISTINCT participants of a sent
+// message have reached at least "delivered" / at least "read" so far —
+// the actual numbers behind the "x/y dibaca" Laravel shows for a group
+// recipient. For a 1:1 chat this naturally collapses to 0 or 1, same as
+// the old single-status behavior, so nothing regresses for phone/user
+// recipients.
+func (s *WaInboxService) aggregateReceiptCounts(waMessageID string) (delivered, read int) {
+	var deliveredCount int64
+	s.db.Model(&models.WaMessageReceipt{}).
+		Where("wa_message_id = ? AND status IN ?", waMessageID, []string{
+			models.WaMessageStatusDelivered, models.WaMessageStatusRead, models.WaMessageStatusPlayed,
+		}).
+		Count(&deliveredCount)
+
+	var readCount int64
+	s.db.Model(&models.WaMessageReceipt{}).
+		Where("wa_message_id = ? AND status IN ?", waMessageID, []string{
+			models.WaMessageStatusRead, models.WaMessageStatusPlayed,
+		}).
+		Count(&readCount)
+
+	return int(deliveredCount), int(readCount)
+}
+
+// recipientTotalFor returns how many people a sent message's receipts
+// could possibly come from: 1 for an individual chat (there's only ever
+// one recipient), or a group's cached member count (see
+// WaChat.ParticipantCount, refreshed here via groupParticipantCount) —
+// 0 if that's a group whose size isn't known yet, which Laravel treats
+// as "denominator unknown, just show the count" rather than "0 members".
+func (s *WaInboxService) recipientTotalFor(deviceID string, chat types.JID) int {
+	if chat.Server != types.GroupServer {
+		return 1
+	}
+
+	client, _ := s.devices.GetClient(deviceID)
+	return s.groupParticipantCount(context.Background(), deviceID, client, chat)
+}
+
+// groupParticipantCount returns a group's member count, preferring
+// whatever's already cached on its WaChat row (group membership rarely
+// changes and GetGroupInfo is a network round trip) and only calling out
+// to WhatsApp — then caching the result — when nothing's cached yet.
+// Mirrors groupName's own caching pattern just above.
+func (s *WaInboxService) groupParticipantCount(ctx context.Context, deviceID string, client *whatsmeow.Client, groupJID types.JID) int {
+	var existing models.WaChat
+	if err := s.db.Where(models.WaChat{DeviceID: deviceID, ChatJID: groupJID.String()}).First(&existing).Error; err == nil && existing.ParticipantCount > 0 {
+		return existing.ParticipantCount
+	}
+
+	if client == nil {
+		return 0
+	}
+
+	info, err := client.GetGroupInfo(ctx, groupJID)
+	if err != nil || info == nil {
+		return 0
+	}
+
+	count := len(info.Participants)
+	if count > 0 {
+		s.db.Model(&models.WaChat{}).
+			Where(models.WaChat{DeviceID: deviceID, ChatJID: groupJID.String()}).
+			Update("participant_count", count)
+	}
+
+	return count
 }
 
 // receiptStatus maps whatsmeow's receipt type to one of our own

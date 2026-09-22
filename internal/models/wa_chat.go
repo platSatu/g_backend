@@ -56,8 +56,21 @@ type WaChat struct {
 	PresenceState string     `gorm:"column:presence_state;size:16" json:"-"`
 	LastSeenAt    *time.Time `gorm:"column:last_seen_at" json:"-"`
 	UnreadCount   int       `gorm:"column:unread_count;not null;default:0" json:"unread_count"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
+
+	// ParticipantCount is a cached group member count — 0 for non-group
+	// chats, or a group whose size hasn't been fetched yet. Refreshed
+	// opportunistically by WaInboxService.groupParticipantCount whenever
+	// a group message receipt needs it and the cached value is still 0,
+	// rather than on every single receipt (GetGroupInfo is a network
+	// round trip to WhatsApp). Powers the "x/y dibaca" denominator
+	// Laravel's Pesan Terjadwal history page shows for group recipients
+	// — see WaMessageReceipt and UpdateMessageStatus's webhook payload.
+	// Not exposed in the /chats JSON response (json:"-"); the frontend
+	// has no use for it there, only Laravel's webhook consumer does.
+	ParticipantCount int `gorm:"column:participant_count;not null;default:0" json:"-"`
+
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 func (WaChat) TableName() string {
