@@ -32,6 +32,16 @@ import (
 // small, cheap delta regardless of how long the chat's history is.
 const messageHistoryLimit = 50
 
+// statusBroadcastJID is WhatsApp's special pseudo-chat that WhatsApp
+// Status ("story") updates and their view receipts flow through — not a
+// real conversation with a real contact. Excluded from ListChats (23
+// September 2026, "itu tidak perlu di tampilkan ... apakah bisa jadi
+// hanya chat saja") so the Inbox only ever shows actual chats/groups, not
+// this pseudo-entry (which previously showed up looking like an ordinary
+// contact named after whoever's Status view most recently touched it —
+// "Daniel Ginting" in the report that surfaced this).
+const statusBroadcastJID = "status@broadcast"
+
 // WaInboxService owns chat/message history for connected WhatsApp
 // devices: persisting incoming messages, listing chats and messages, and
 // sending outgoing text messages through the live whatsmeow client
@@ -440,7 +450,7 @@ func (s *WaInboxService) ListChats(userID string, deviceID string) ([]models.WaC
 
 	var chats []models.WaChat
 	err := s.db.
-		Where("device_id = ?", deviceID).
+		Where("device_id = ? AND chat_jid <> ?", deviceID, statusBroadcastJID).
 		Order("last_message_at DESC").
 		Find(&chats).Error
 	if err != nil {
@@ -721,8 +731,8 @@ func (s *WaInboxService) ensureAvatar(deviceID string, chatJID string) {
 // *browser* request's own headers/origin, not from needing WhatsApp
 // session auth, so a normal server-side request with a real-looking
 // User-Agent succeeds where a bare <img src> did not.
-func downloadAvatarBytes(url string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+func downloadAvatarBytes(pictureURL string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, pictureURL, nil)
 	if err != nil {
 		return nil, err
 	}
