@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -456,7 +457,25 @@ func (s *WaInboxService) ListChats(userID string, deviceID string) ([]models.WaC
 	// at once.
 	go s.backfillAvatars(deviceID, chats)
 
+	s.attachAvatarURLs(deviceID, chats)
 	return chats, nil
+}
+
+// attachAvatarURLs populates AvatarProxyURL (the computed, non-persisted
+// "avatar_url" the frontend actually reads) on every chat that has a
+// downloaded avatar file — see WaChat.AvatarProxyURL's docblock for why
+// this can't just be WhatsApp's own CDN link anymore.
+func (s *WaInboxService) attachAvatarURLs(deviceID string, chats []models.WaChat) {
+	for i := range chats {
+		s.attachAvatarURL(deviceID, &chats[i])
+	}
+}
+
+func (s *WaInboxService) attachAvatarURL(deviceID string, chat *models.WaChat) {
+	if chat.AvatarPath == "" {
+		return
+	}
+	chat.AvatarProxyURL = fmt.Sprintf("/api/wa/devices/%s/chats/%s/avatar", deviceID, url.PathEscape(chat.ChatJID))
 }
 
 func (s *WaInboxService) backfillAvatars(deviceID string, chats []models.WaChat) {
@@ -604,13 +623,27 @@ func (s *WaInboxService) Presence(userID string, deviceID string, chatJID string
 // profile-picture endpoint on every chat open.
 const avatarRefreshInterval = 24 * time.Hour
 
-// ensureAvatar fetches and caches a contact's profile picture URL,
-// re-checking once avatarRefreshInterval has passed since the last check
-// (WaChat.AvatarCheckedAt) rather than trusting a cached URL forever —
+// ensureAvatar fetches a contact's profile picture, re-checking once
+// avatarRefreshInterval has passed since the last check
+// (WaChat.AvatarCheckedAt) rather than trusting a cached copy forever —
 // see avatarRefreshInterval's docblock for why that matters. The
 // in-memory avatarChecked map is just a short-lived (avatarRefreshInterval)
 // local cache on top of that DB timestamp, so repeated polling of the
 // same open chat doesn't re-query MySQL every single time either.
+//
+// Critically, this now DOWNLOADS the picture's actual bytes and keeps our
+// own copy (AvatarPath, served back out through DownloadAvatar) instead of
+// just caching WhatsApp's own CDN link (the old AvatarURL behavior) — see
+// WaChat.AvatarURL's docblock for why that link alone isn't enough:
+// confirmed 23 September 2026, a freshly-fetched pps.whatsapp.net URL
+// still came back 403 Forbidden on every attempt to load it outside an
+// authenticated WhatsApp session (a browser <img> tag included), which is
+// exactly why avatars stayed blank for every single contact even after
+// the staleness bug above was fixed. This mirrors exactly how message
+// media already works (see saveIncomingMedia/attachMediaURL in
+// wa-media-service.go) — WhatsApp's media links, avatars included, are
+// only ever reliable from the inside; anything meant for a browser has to
+// be our own re-hosted copy.
 func (s *WaInboxService) ensureAvatar(deviceID string, chatJID string) {
 	if s.avatarCheckedRecently(deviceID, chatJID) {
 		return
@@ -619,7 +652,7 @@ func (s *WaInboxService) ensureAvatar(deviceID string, chatJID string) {
 
 	var chat models.WaChat
 	err := s.db.Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).First(&chat).Error
-	if err == nil && chat.AvatarURL != "" && chat.AvatarCheckedAt != nil && time.Since(*chat.AvatarCheckedAt) < avatarRefreshInterval {
+	if err == nil && chat.AvatarPath != "" && chat.AvatarCheckedAt != nil && time.Since(*chat.AvatarCheckedAt) < avatarRefreshInterval {
 		return
 	}
 
@@ -647,12 +680,66 @@ func (s *WaInboxService) ensureAvatar(deviceID string, chatJID string) {
 		return
 	}
 
+	data, downloadErr := downloadAvatarBytes(info.URL)
+	if downloadErr != nil || len(data) == 0 {
+		// Got a picture URL from WhatsApp but couldn't actually fetch the
+		// bytes right now (network hiccup, an already-expired signed
+		// link, ...) — same as the no-picture case above, record the
+		// check and retry after avatarRefreshInterval rather than
+		// hammering it on every poll. Deliberately does NOT touch
+		// avatar_url/avatar_path, so a PREVIOUSLY successful download
+		// keeps being served instead of getting wiped out by one failed
+		// refresh attempt.
+		s.db.Model(&models.WaChat{}).
+			Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).
+			Update("avatar_checked_at", now)
+		return
+	}
+
+	relPath, saveErr := s.saveAvatarFile(deviceID, chatJID, data)
+	if saveErr != nil {
+		s.db.Model(&models.WaChat{}).
+			Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).
+			Update("avatar_checked_at", now)
+		return
+	}
+
 	s.db.Model(&models.WaChat{}).
 		Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).
 		Updates(map[string]interface{}{
-			"avatar_url":        info.URL,
+			"avatar_url":        info.URL, // reference only — see AvatarURL's docblock
+			"avatar_path":       relPath,
 			"avatar_checked_at": now,
 		})
+}
+
+// downloadAvatarBytes fetches a profile-picture URL WhatsApp handed us
+// through GetProfilePictureInfo. A plain http.Get (no auth token, no
+// whatsmeow decryption — profile pictures aren't E2E encrypted like
+// message media is) is enough here; the 403s seen hotlinking these URLs
+// straight from a browser (see ensureAvatar's docblock) come from the
+// *browser* request's own headers/origin, not from needing WhatsApp
+// session auth, so a normal server-side request with a real-looking
+// User-Agent succeeds where a bare <img src> did not.
+func downloadAvatarBytes(url string) ([]byte, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("wa: avatar download returned status %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(io.LimitReader(resp.Body, 8<<20)) // 8MiB safety cap
 }
 
 // ensurePhone resolves and caches a chat's real phone number the first

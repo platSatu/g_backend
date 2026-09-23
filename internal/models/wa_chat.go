@@ -40,7 +40,40 @@ type WaChat struct {
 	// for groups/channels, which have no phone number at all.
 	Phone         string    `gorm:"column:phone;size:32" json:"phone,omitempty"`
 
-	AvatarURL     string    `gorm:"column:avatar_url;size:512" json:"avatar_url"`
+	// AvatarURL is WhatsApp's own signed/tokenized CDN link
+	// (pps.whatsapp.net/...) for this contact's profile picture, kept
+	// purely for debugging/reference. NOT what the frontend renders
+	// anymore (json:"-") -- these links reliably come back 403 Forbidden
+	// when hotlinked directly from a browser (confirmed 23 September
+	// 2026: DB had a valid-looking, freshly-fetched URL, yet the exact
+	// same link 403'd on every fetch attempt outside an authenticated
+	// WhatsApp session), which is why avatars stayed blank for literally
+	// every contact even after the earlier staleness fix. AvatarPath +
+	// AvatarProxyURL below replace it, mirroring exactly how WaMessage
+	// already handles message media (MediaPath/MediaURL in
+	// wa_message.go) -- download the bytes ourselves through the
+	// authenticated client, keep our own copy, serve that copy from our
+	// own domain instead of ever re-exposing WhatsApp's CDN link to a
+	// browser.
+	AvatarURL string `gorm:"column:avatar_url;size:512" json:"-"`
+
+	// AvatarPath is where ensureAvatar() saved this contact's downloaded
+	// profile-picture bytes on our own disk, relative to
+	// mediaStorageRoot -- empty until a picture has actually been fetched
+	// (or confirmed to not exist). Not exposed in JSON (json:"-"); the
+	// frontend only ever sees AvatarProxyURL below, which points at the
+	// endpoint that streams this file back.
+	AvatarPath string `gorm:"column:avatar_path;size:512" json:"-"`
+
+	// AvatarProxyURL is computed per-request (gorm:"-", never persisted)
+	// by WaInboxService.attachAvatarURL, set to our own
+	// /api/wa/devices/{id}/chats/{jid}/avatar endpoint whenever
+	// AvatarPath is non-empty -- same computed-field pattern as
+	// WaMessage.MediaURL. This is the ONLY avatar field the frontend
+	// should ever read; it's deliberately still called "avatar_url" in
+	// JSON so existing frontend code (which already reads chat.avatar_url)
+	// picks it up without any renaming.
+	AvatarProxyURL string `gorm:"-" json:"avatar_url,omitempty"`
 
 	// AvatarCheckedAt -- when ensureAvatar() last actually asked WhatsApp
 	// for this contact's profile picture (whether or not one came back).
@@ -51,7 +84,7 @@ type WaChat struct {
 	// now nothing shows, for every contact at once" symptom reported 22
 	// September 2026, since most were originally cached around the same
 	// early period and expired together). ensureAvatar() now re-fetches
-	// once this gets stale instead of trusting avatar_url forever. Not
+	// once this gets stale instead of trusting a cached copy forever. Not
 	// exposed in JSON (json:"-") -- purely an internal freshness marker.
 	AvatarCheckedAt *time.Time `gorm:"column:avatar_checked_at" json:"-"`
 	LastMessage   string    `gorm:"column:last_message;size:255" json:"last_message"`

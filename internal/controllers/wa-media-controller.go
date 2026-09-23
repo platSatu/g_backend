@@ -141,3 +141,38 @@ func (mc *WaMediaController) DownloadMedia(c *gin.Context) {
 	}
 	c.File(path)
 }
+
+// DownloadAvatar streams a chat contact's downloaded profile-picture
+// file back to the caller — the endpoint WaChat.AvatarProxyURL points
+// at. Mirrors DownloadMedia just above; see WaChat.AvatarURL's docblock
+// (models/wa_chat.go) for why this proxy exists instead of the frontend
+// ever loading WhatsApp's own CDN link directly (it 403s outside an
+// authenticated WhatsApp session).
+func (mc *WaMediaController) DownloadAvatar(c *gin.Context) {
+	userID := c.GetString("user_id")
+	deviceID, ok := deviceIDParam(c)
+	if !ok {
+		return
+	}
+
+	chatJID := c.Param("jid")
+	if chatJID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid chat id"})
+		return
+	}
+
+	path, mimeType, err := mc.inboxService.GetAvatarFile(userID, deviceID, chatJID)
+	if err != nil {
+		if errors.Is(err, service.ErrDeviceNotFound) || errors.Is(err, service.ErrMediaNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "avatar not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if mimeType != "" {
+		c.Header("Content-Type", mimeType)
+	}
+	c.File(path)
+}

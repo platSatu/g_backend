@@ -319,6 +319,64 @@ func (s *WaInboxService) saveMediaFile(deviceID string, messageID string, fileNa
 	return relPath, nil
 }
 
+// saveAvatarFile writes a contact's downloaded profile-picture bytes to
+// {mediaStorageRoot}/{deviceID}/avatars/{sanitized chatJID}.jpg and
+// returns the path relative to mediaStorageRoot (what's stored in
+// WaChat.AvatarPath — see its docblock for why this exists instead of
+// just caching WhatsApp's own CDN link). Kept in its own "avatars"
+// subfolder, separate from saveMediaFile's per-message files, purely so
+// the two can never collide on a sanitized filename (a chat JID and a
+// WhatsApp message ID happen to sanitize into similar-looking strings)
+// and so an operator can tell the two apart on disk at a glance.
+//
+// Always .jpg: every profile picture WhatsApp hands back through
+// GetProfilePictureInfo is a JPEG in practice (same assumption
+// WhatsApp's own official clients make), so this skips the
+// content-sniffing saveMediaFile does via the source filename's
+// extension — there's no filename here, just a signed CDN URL.
+func (s *WaInboxService) saveAvatarFile(deviceID string, chatJID string, data []byte) (string, error) {
+	safeJID := sanitizeForFilename(chatJID)
+	if safeJID == "" {
+		safeJID = util.NewUUID()
+	}
+
+	dir := filepath.Join(s.mediaStorageRoot, deviceID, "avatars")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("wa: failed to create avatar dir: %w", err)
+	}
+
+	relPath := filepath.Join(deviceID, "avatars", safeJID+".jpg")
+	fullPath := filepath.Join(s.mediaStorageRoot, relPath)
+
+	if err := os.WriteFile(fullPath, data, 0o644); err != nil {
+		return "", fmt.Errorf("wa: failed to write avatar file: %w", err)
+	}
+
+	return relPath, nil
+}
+
+// GetAvatarFile resolves a chat's downloaded avatar file's absolute disk
+// path, after checking the caller actually owns the device it belongs to
+// — same ownership boundary GetMediaFile enforces just above. Controllers
+// stream the file straight from the returned path; this layer only
+// authorizes and locates it.
+func (s *WaInboxService) GetAvatarFile(userID string, deviceID string, chatJID string) (path string, mimeType string, err error) {
+	if err := s.devices.AssertOwnership(userID, deviceID); err != nil {
+		return "", "", err
+	}
+
+	var chat models.WaChat
+	if dbErr := s.db.Where(models.WaChat{DeviceID: deviceID, ChatJID: chatJID}).First(&chat).Error; dbErr != nil {
+		return "", "", ErrMediaNotFound
+	}
+
+	if chat.AvatarPath == "" {
+		return "", "", ErrMediaNotFound
+	}
+
+	return filepath.Join(s.mediaStorageRoot, chat.AvatarPath), "image/jpeg", nil
+}
+
 // sanitizeForFilename keeps a WhatsApp message ID filename-safe. IDs are
 // normally already alphanumeric, but this is a small defensive pass
 // since the value ends up as part of a real disk path.
